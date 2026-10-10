@@ -10,29 +10,29 @@ import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
-import net.minecraft.core.Holder;
-import net.minecraft.network.chat.Component;
-import net.minecraft.tags.ItemTags;
-import net.minecraft.world.InteractionHand;
-import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.inventory.ChestMenu;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
-import net.minecraft.world.item.enchantment.Enchantment;
-import net.minecraft.world.item.enchantment.Enchantments;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.phys.BlockHitResult;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.block.Blocks;
+import net.minecraft.enchantment.Enchantment;
+import net.minecraft.enchantment.Enchantments;
+import net.minecraft.entity.ItemEntity;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.screen.GenericContainerScreenHandler;
+import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
 /**
- * Spawner Protect (Meteor Client addon module, Fabric 1.21.11, Mojang mappings)
+ * Spawner Protect (Meteor Client addon module, Fabric 1.21.11, Yarn mappings)
  *
  * Flow: detect player -> mine every spawner nearby (silk touch pickaxe in hotbar)
  *       -> walk over and collect the drops -> put them in your ender chest -> disconnect.
@@ -98,7 +98,7 @@ public class SpawnerProtect extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null || mc.level == null) return;
+        if (mc.player == null || mc.world == null) return;
         stopWalking();
 
         if (state != State.IDLE) {
@@ -111,7 +111,7 @@ public class SpawnerProtect extends Module {
 
         switch (state) {
             case IDLE -> {
-                Player p = findIntruder();
+                PlayerEntity p = findIntruder();
                 if (p != null) {
                     reason = p.getName().getString();
                     info("Player detected: " + reason + " - securing spawners.");
@@ -127,8 +127,8 @@ public class SpawnerProtect extends Module {
 
     // ---------------------------------------------------------------- detection
 
-    private Player findIntruder() {
-        for (Player p : mc.level.players()) {
+    private PlayerEntity findIntruder() {
+        for (PlayerEntity p : mc.world.getPlayers()) {
             if (p == mc.player || p.isSpectator()) continue;
             if (ignoreFriends.get() && Friends.get().isFriend(p)) continue;
             String name = p.getName().getString();
@@ -149,7 +149,7 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        FindItemResult pick = InvUtils.findInHotbar(s -> s.is(ItemTags.PICKAXES) && hasSilkTouch(s));
+        FindItemResult pick = InvUtils.findInHotbar(s -> s.isIn(ItemTags.PICKAXES) && hasSilkTouch(s));
         if (!pick.found()) {
             error("No silk touch pickaxe in hotbar!");
             state = State.LEAVE;
@@ -158,9 +158,9 @@ public class SpawnerProtect extends Module {
         InvUtils.swap(pick.slot(), false);
 
         BlockPos target = spawners.get(0);
-        Vec3 center = Vec3.atCenterOf(target);
+        Vec3d center = Vec3d.ofCenter(target);
 
-        if (mc.player.getEyePosition().distanceTo(center) > 4.3) {
+        if (mc.player.getEyePos().distanceTo(center) > 4.3) {
             walkTo(center);
             return;
         }
@@ -178,16 +178,16 @@ public class SpawnerProtect extends Module {
     private void collect() {
         ItemEntity nearest = null;
         double best = Double.MAX_VALUE;
-        for (ItemEntity e : mc.level.getEntitiesOfClass(ItemEntity.class,
-                mc.player.getBoundingBox().inflate(spawnerRange.get() + 4),
-                i -> i.getItem().is(Items.SPAWNER))) {
-            double d = mc.player.distanceToSqr(e);
+        for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
+                mc.player.getBoundingBox().expand(spawnerRange.get() + 4),
+                i -> i.getStack().isOf(Items.SPAWNER))) {
+            double d = mc.player.squaredDistanceTo(e);
             if (d < best) { best = d; nearest = e; }
         }
 
         if (nearest != null) {
             waitTicks = 0;
-            walkTo(new Vec3(nearest.getX(), nearest.getY(), nearest.getZ()));
+            walkTo(new Vec3d(nearest.getX(), nearest.getY(), nearest.getZ()));
             return;
         }
 
@@ -207,20 +207,20 @@ public class SpawnerProtect extends Module {
 
     private void deposit() {
         if (countSpawners() == 0) {
-            if (mc.player.containerMenu instanceof ChestMenu) mc.player.closeContainer();
+            if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler) mc.player.closeHandledScreen();
             info("All spawners stored.");
             state = State.LEAVE;
             return;
         }
 
         // Chest GUI is open -> shift-click spawners in.
-        if (mc.player.containerMenu instanceof ChestMenu menu) {
+        if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler handler) {
             if (actionTimer-- > 0) return;
             actionTimer = depositDelay.get();
 
-            int chestSlots = menu.getRowCount() * 9;
-            for (int i = chestSlots; i < menu.slots.size(); i++) {
-                if (menu.getSlot(i).getItem().is(Items.SPAWNER)) {
+            int chestSlots = handler.getRows() * 9;
+            for (int i = chestSlots; i < handler.slots.size(); i++) {
+                if (handler.getSlot(i).getStack().isOf(Items.SPAWNER)) {
                     InvUtils.shiftClick().slotId(i);
                     noProgressTicks = 0;
                     return;
@@ -250,25 +250,25 @@ public class SpawnerProtect extends Module {
         }
 
         BlockPos chest = chests.get(0);
-        Vec3 center = Vec3.atCenterOf(chest);
-        if (mc.player.getEyePosition().distanceTo(center) > 4.3) {
+        Vec3d center = Vec3d.ofCenter(chest);
+        if (mc.player.getEyePos().distanceTo(center) > 4.3) {
             walkTo(center);
             return;
         }
 
         if (noProgressTicks % 10 == 0) {
-            mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND,
+            mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND,
                 new BlockHitResult(center, Direction.UP, chest, false));
         }
     }
 
     private BlockPos findPlaceSpot() {
-        BlockPos base = mc.player.blockPosition();
-        for (Direction d : Direction.Plane.HORIZONTAL) {
-            BlockPos p = base.relative(d);
-            if (mc.level.getBlockState(p).canBeReplaced()
-                && mc.level.getBlockState(p.above()).isAir()
-                && !mc.level.getBlockState(p.below()).canBeReplaced()) return p;
+        BlockPos base = mc.player.getBlockPos();
+        for (Direction d : Direction.Type.HORIZONTAL) {
+            BlockPos p = base.offset(d);
+            if (mc.world.getBlockState(p).isReplaceable()
+                && mc.world.getBlockState(p.up()).isAir()
+                && !mc.world.getBlockState(p.down()).isReplaceable()) return p;
         }
         return null;
     }
@@ -277,11 +277,11 @@ public class SpawnerProtect extends Module {
 
     private void leave() {
         stopWalking();
-        if (mc.player.containerMenu instanceof ChestMenu) mc.player.closeContainer();
+        if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler) mc.player.closeHandledScreen();
 
         String msg = "[SpawnerProtect] Player detected (" + reason + ") - spawners secured.";
-        if (disconnect.get() && mc.getConnection() != null) {
-            mc.getConnection().getConnection().disconnect(Component.literal(msg));
+        if (disconnect.get() && mc.getNetworkHandler() != null) {
+            mc.getNetworkHandler().getConnection().disconnect(Text.literal(msg));
         } else {
             info(msg);
         }
@@ -292,46 +292,45 @@ public class SpawnerProtect extends Module {
 
     private List<BlockPos> findBlocks(int range, boolean spawner) {
         List<BlockPos> list = new ArrayList<>();
-        BlockPos c = mc.player.blockPosition();
+        BlockPos c = mc.player.getBlockPos();
         for (int x = -range; x <= range; x++)
             for (int y = -range; y <= range; y++)
                 for (int z = -range; z <= range; z++) {
-                    BlockPos p = c.offset(x, y, z);
-                    var state = mc.level.getBlockState(p);
-                    if (spawner ? state.is(Blocks.SPAWNER) : state.is(Blocks.ENDER_CHEST)) list.add(p);
+                    BlockPos p = c.add(x, y, z);
+                    var b = mc.world.getBlockState(p).getBlock();
+                    if (spawner ? b == Blocks.SPAWNER : b == Blocks.ENDER_CHEST) list.add(p);
                 }
-        list.sort(Comparator.comparingDouble(p -> mc.player.distanceToSqr(Vec3.atCenterOf(p))));
+        list.sort(Comparator.comparingDouble(p -> mc.player.squaredDistanceTo(Vec3d.ofCenter(p))));
         return list;
     }
 
     private int countSpawners() {
         int n = 0;
-        var inv = mc.player.getInventory();
-        for (int i = 0; i < inv.getContainerSize(); i++) {
-            ItemStack s = inv.getItem(i);
-            if (s.is(Items.SPAWNER)) n += s.getCount();
+        for (int i = 0; i < mc.player.getInventory().size(); i++) {
+            ItemStack s = mc.player.getInventory().getStack(i);
+            if (s.isOf(Items.SPAWNER)) n += s.getCount();
         }
         return n;
     }
 
     private boolean hasSilkTouch(ItemStack stack) {
-        for (Holder<Enchantment> e : stack.getEnchantments().keySet())
-            if (e.is(Enchantments.SILK_TOUCH)) return true;
+        for (RegistryEntry<Enchantment> e : stack.getEnchantments().getEnchantments())
+            if (e.matchesKey(Enchantments.SILK_TOUCH)) return true;
         return false;
     }
 
-    private void walkTo(Vec3 target) {
+    private void walkTo(Vec3d target) {
         double dx = target.x - mc.player.getX();
         double dz = target.z - mc.player.getZ();
-        mc.player.setYRot((float) Math.toDegrees(Math.atan2(dz, dx)) - 90f);
-        mc.options.keyUp.setDown(true);
-        if (mc.player.horizontalCollision) mc.options.keyJump.setDown(true);
+        mc.player.setYaw((float) Math.toDegrees(Math.atan2(dz, dx)) - 90f);
+        mc.options.forwardKey.setPressed(true);
+        if (mc.player.horizontalCollision) mc.options.jumpKey.setPressed(true);
     }
 
     private void stopWalking() {
         if (mc.options != null) {
-            mc.options.keyUp.setDown(false);
-            mc.options.keyJump.setDown(false);
+            mc.options.forwardKey.setPressed(false);
+            mc.options.jumpKey.setPressed(false);
         }
     }
 }
