@@ -1,9 +1,9 @@
 package com.example.addon.modules;
 
+import com.example.addon.AddonTemplate;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.friends.Friends;
-import meteordevelopment.meteorclient.systems.modules.Categories;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
@@ -34,13 +34,16 @@ import java.util.List;
 /**
  * Spawner Protect (Meteor Client addon module, Fabric 1.21.11, Yarn mappings)
  *
- * Flow: detect player -> mine every spawner nearby (silk touch pickaxe in hotbar)
- *       -> walk over and collect the drops -> put them in your ender chest -> disconnect.
+ * Flow: detect player -> mine every spawner nearby (crouching, silk touch pickaxe in hotbar)
+ *       -> walk over and collect the drops -> double check nothing was missed
+ *       -> put them in your ender chest -> disconnect.
  *
  * Requirements: silk touch pickaxe in hotbar. An ender chest either already placed
  * nearby, or an ender chest item in your hotbar (the module will place one).
  */
 public class SpawnerProtect extends Module {
+    private static final int MAX_VERIFY_PASSES = 3;
+
     private final SettingGroup sg = settings.getDefaultGroup();
 
     private final Setting<Integer> detectRange = sg.add(new IntSetting.Builder()
@@ -59,6 +62,14 @@ public class SpawnerProtect extends Module {
         .name("spawner-range").description("How far to look for spawners.")
         .defaultValue(12).min(1).sliderMax(16).build());
 
+    private final Setting<Boolean> crouchWhileMining = sg.add(new BoolSetting.Builder()
+        .name("crouch-while-mining").description("Hold sneak while breaking spawners.")
+        .defaultValue(true).build());
+
+    private final Setting<Boolean> doubleCheck = sg.add(new BoolSetting.Builder()
+        .name("double-check").description("Before storing, re-scan for spawners still placed or still on the ground.")
+        .defaultValue(true).build());
+
     private final Setting<Integer> depositDelay = sg.add(new IntSetting.Builder()
         .name("deposit-delay").description("Ticks between each shift-click into the ender chest.")
         .defaultValue(2).min(0).sliderMax(10).build());
@@ -74,14 +85,14 @@ public class SpawnerProtect extends Module {
         .name("disconnect-when-done").description("Leave the server when finished.")
         .defaultValue(true).build());
 
-    private enum State { IDLE, MINING, COLLECTING, DEPOSIT, LEAVE }
+    private enum State { IDLE, MINING, COLLECTING, VERIFY, DEPOSIT, LEAVE }
 
     private State state = State.IDLE;
-    private int ticksActive, waitTicks, actionTimer, noProgressTicks;
+    private int ticksActive, waitTicks, actionTimer, noProgressTicks, verifyPasses;
     private String reason = "";
 
     public SpawnerProtect() {
-        super(Categories.World, "spawner-protect",
+        super(AddonTemplate.CATEGORY, "spawner-protect",
             "Picks up spawners when a player shows up, stashes them in your ender chest, then logs you out.");
     }
 
@@ -93,15 +104,17 @@ public class SpawnerProtect extends Module {
 
     private void reset() {
         state = State.IDLE;
-        ticksActive = waitTicks = actionTimer = noProgressTicks = 0;
+        ticksActive = waitTicks = actionTimer = noProgressTicks = verifyPasses = 0;
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null) return;
-        stopWalking();
 
+        // Only take over the movement keys once we're actually working,
+        // so you can still walk around normally while the module is just watching.
         if (state != State.IDLE) {
+            stopWalking();
             ticksActive++;
             if (timeout.get() > 0 && ticksActive > timeout.get() * 20 && state != State.LEAVE) {
                 warning("Timed out, leaving.");
@@ -120,6 +133,7 @@ public class SpawnerProtect extends Module {
             }
             case MINING -> mine();
             case COLLECTING -> collect();
+            case VERIFY -> verify();
             case DEPOSIT -> deposit();
             case LEAVE -> leave();
         }
@@ -165,6 +179,8 @@ public class SpawnerProtect extends Module {
             return;
         }
 
+        if (crouchWhileMining.get()) mc.options.sneakKey.setPressed(true);
+
         if (rotate.get()) {
             Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target),
                 () -> BlockUtils.breakBlock(target, true));
@@ -176,15 +192,7 @@ public class SpawnerProtect extends Module {
     // ---------------------------------------------------------------- collecting
 
     private void collect() {
-        ItemEntity nearest = null;
-        double best = Double.MAX_VALUE;
-        for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
-                mc.player.getBoundingBox().expand(spawnerRange.get() + 4),
-                i -> i.getStack().isOf(Items.SPAWNER))) {
-            double d = mc.player.squaredDistanceTo(e);
-            if (d < best) { best = d; nearest = e; }
-        }
-
+        ItemEntity nearest = nearestSpawnerDrop(spawnerRange.get() + 4);
         if (nearest != null) {
             waitTicks = 0;
             walkTo(new Vec3d(nearest.getX(), nearest.getY(), nearest.getZ()));
@@ -194,6 +202,39 @@ public class SpawnerProtect extends Module {
         // Drops can take a moment to appear / get picked up.
         if (++waitTicks < 15) return;
 
+        if (doubleCheck.get() && verifyPasses < MAX_VERIFY_PASSES) {
+            waitTicks = 0;
+            state = State.VERIFY;
+            return;
+        }
+        finishPickup();
+    }
+
+    // ---------------------------------------------------------------- double check
+
+    private void verify() {
+        if (++waitTicks < 20) return; // give the server a second to settle
+
+        if (!findBlocks(spawnerRange.get(), true).isEmpty()) {
+            verifyPasses++;
+            warning("Double check: a spawner is still placed, mining it (" + verifyPasses + "/" + MAX_VERIFY_PASSES + ").");
+            state = State.MINING;
+            return;
+        }
+
+        if (nearestSpawnerDrop(spawnerRange.get() + 8) != null) {
+            verifyPasses++;
+            warning("Double check: a spawner is still on the ground, collecting it (" + verifyPasses + "/" + MAX_VERIFY_PASSES + ").");
+            waitTicks = 0;
+            state = State.COLLECTING;
+            return;
+        }
+
+        info("Double check passed: no spawners left nearby.");
+        finishPickup();
+    }
+
+    private void finishPickup() {
         if (countSpawners() > 0) {
             noProgressTicks = 0;
             state = State.DEPOSIT;
@@ -290,6 +331,18 @@ public class SpawnerProtect extends Module {
 
     // ---------------------------------------------------------------- helpers
 
+    private ItemEntity nearestSpawnerDrop(double radius) {
+        ItemEntity nearest = null;
+        double best = Double.MAX_VALUE;
+        for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
+                mc.player.getBoundingBox().expand(radius),
+                i -> i.getStack().isOf(Items.SPAWNER))) {
+            double d = mc.player.squaredDistanceTo(e);
+            if (d < best) { best = d; nearest = e; }
+        }
+        return nearest;
+    }
+
     private List<BlockPos> findBlocks(int range, boolean spawner) {
         List<BlockPos> list = new ArrayList<>();
         BlockPos c = mc.player.getBlockPos();
@@ -331,6 +384,7 @@ public class SpawnerProtect extends Module {
         if (mc.options != null) {
             mc.options.forwardKey.setPressed(false);
             mc.options.jumpKey.setPressed(false);
+            mc.options.sneakKey.setPressed(false);
         }
     }
 }
