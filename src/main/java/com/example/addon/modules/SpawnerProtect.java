@@ -35,7 +35,9 @@ import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Spawner Protect (Meteor Client addon module, Fabric 1.21.11, Yarn mappings)
@@ -88,13 +90,17 @@ public class SpawnerProtect extends Module {
         .name("look-speed").description("Max degrees your view turns per tick when facing a spawner.")
         .defaultValue(25).min(1).sliderMax(90).visible(lookAtSpawner::get).build());
 
+    private final Setting<Integer> skipTimeout = sg.add(new IntSetting.Builder()
+        .name("skip-timeout").description("If a spawner can't be broken within this many seconds (anti-cheat), skip it, mine the rest, then try it once more. If it still fails, store the rest, leave and rejoin.")
+        .defaultValue(10).min(2).sliderMax(30).build());
+
     private final Setting<Boolean> rotate = sg.add(new BoolSetting.Builder()
         .name("rotate").description("Silent rotation for placing the ender chest (and for mining when look-at-spawner is off).")
         .defaultValue(true).build());
 
     private final Setting<Integer> timeout = sg.add(new IntSetting.Builder()
         .name("timeout-seconds").description("Safety: disconnect after this long even if not finished. 0 = off.")
-        .defaultValue(90).min(0).sliderMax(300).build());
+        .defaultValue(180).min(0).sliderMax(600).build());
 
     private final Setting<Boolean> disconnect = sg.add(new BoolSetting.Builder()
         .name("disconnect-when-done").description("Leave the server when finished.")
@@ -118,8 +124,11 @@ public class SpawnerProtect extends Module {
     private int ticksActive, waitTicks, actionTimer, noProgressTicks, verifyPasses;
     private String reason = "";
     private ServerInfo lastServer;
-    private BlockPos lookTarget;
-    private int lookTicks;
+    private BlockPos lookTarget, mineTarget;
+    private int lookTicks, mineTicks, openCooldown, chestLookTicks;
+    private final Set<BlockPos> skipped = new HashSet<>();
+    private boolean retriedSkipped, forceRejoin, chestOpenSeen;
+    private String lastMsg = "";
     private int rejoinTimer, connectTicks, connectAttempts, rounds;
 
     public SpawnerProtect() {
@@ -138,8 +147,11 @@ public class SpawnerProtect extends Module {
         ticksActive = waitTicks = actionTimer = noProgressTicks = verifyPasses = 0;
         rejoinTimer = connectTicks = connectAttempts = rounds = 0;
         lastServer = null;
-        lookTarget = null;
-        lookTicks = 0;
+        lookTarget = mineTarget = null;
+        lookTicks = mineTicks = openCooldown = chestLookTicks = 0;
+        skipped.clear();
+        retriedSkipped = forceRejoin = chestOpenSeen = false;
+        lastMsg = "";
     }
 
     @EventHandler
@@ -198,8 +210,22 @@ public class SpawnerProtect extends Module {
     // ---------------------------------------------------------------- mining
 
     private void mine() {
-        List<BlockPos> spawners = findBlocks(spawnerRange.get(), true);
+        List<BlockPos> all = findBlocks(spawnerRange.get(), true);
+        List<BlockPos> spawners = new ArrayList<>();
+        for (BlockPos p : all) if (!skipped.contains(p)) spawners.add(p);
+
         if (spawners.isEmpty()) {
+            if (!all.isEmpty()) {
+                // Only spawners that failed earlier are left.
+                if (!retriedSkipped) {
+                    retriedSkipped = true;
+                    skipped.clear();
+                    say("Everything else is mined - retrying the spawner(s) that failed.");
+                    return;
+                }
+                forceRejoin = true;
+                warning("Couldn't mine " + all.size() + " spawner(s) (anti-cheat?). Storing the rest, then leaving and rejoining.");
+            }
             waitTicks = 0;
             state = State.COLLECTING;
             return;
@@ -223,6 +249,11 @@ public class SpawnerProtect extends Module {
 
         if (crouchWhileMining.get()) mc.options.sneakKey.setPressed(true);
 
+        if (!target.equals(mineTarget)) {
+            mineTarget = target;
+            mineTicks = 0;
+        }
+
         if (lookAtSpawner.get()) {
             if (!target.equals(lookTarget)) {
                 lookTarget = target;
@@ -232,15 +263,21 @@ public class SpawnerProtect extends Module {
             // Wait until the crosshair is on the spawner. If something is in the way
             // and it never lines up, stop waiting after 2 seconds and mine anyway.
             if (!isLookingAt(target) && ++lookTicks < 40) return;
-            BlockUtils.breakBlock(target, true);
+        }
+
+        // Anti-cheat sometimes refuses one spawner: give up on it for now.
+        if (++mineTicks > skipTimeout.get() * 20) {
+            skipped.add(target);
+            mineTarget = null;
+            warning("Couldn't break the spawner at " + target.getX() + " " + target.getY() + " " + target.getZ() + " - skipping it for now.");
             return;
         }
 
-        if (rotate.get()) {
+        if (lookAtSpawner.get() || !rotate.get()) {
+            BlockUtils.breakBlock(target, true);
+        } else {
             Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target),
                 () -> BlockUtils.breakBlock(target, true));
-        } else {
-            BlockUtils.breakBlock(target, true);
         }
     }
 
@@ -287,7 +324,7 @@ public class SpawnerProtect extends Module {
     private void verify() {
         if (++waitTicks < 20) return; // give the server a second to settle
 
-        if (!findBlocks(spawnerRange.get(), true).isEmpty()) {
+        if (hasUnskippedSpawner()) {
             verifyPasses++;
             warning("Double check: a spawner is still placed, mining it (" + verifyPasses + "/" + MAX_VERIFY_PASSES + ").");
             state = State.MINING;
@@ -328,6 +365,11 @@ public class SpawnerProtect extends Module {
 
         // Chest GUI is open -> shift-click spawners in.
         if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler handler) {
+            if (!chestOpenSeen) {
+                chestOpenSeen = true;
+                actionTimer = 5; // short pause so the server and client agree on the contents
+                say("Ender chest open - moving spawners in.");
+            }
             if (actionTimer-- > 0) return;
             actionTimer = depositDelay.get();
 
@@ -341,10 +383,10 @@ public class SpawnerProtect extends Module {
             }
             return;
         }
+        chestOpenSeen = false;
 
-        // Chest is full / nothing moving.
-        if (++noProgressTicks > 200) {
-            warning("Couldn't deposit everything (ender chest full?).");
+        if (++noProgressTicks > 300) {
+            warning("Couldn't deposit everything (couldn't open the ender chest, or it's full).");
             state = State.LEAVE;
             return;
         }
@@ -357,6 +399,7 @@ public class SpawnerProtect extends Module {
                 state = State.LEAVE;
                 return;
             }
+            say("No ender chest nearby - placing the one from your hotbar.");
             BlockPos spot = findPlaceSpot();
             if (spot != null) BlockUtils.place(spot, ec, rotate.get(), 50);
             return;
@@ -365,14 +408,24 @@ public class SpawnerProtect extends Module {
         BlockPos chest = chests.get(0);
         Vec3d center = Vec3d.ofCenter(chest);
         if (mc.player.getEyePos().distanceTo(center) > 4.3) {
+            say("Walking to the ender chest.");
             walkTo(center);
             return;
         }
 
-        if (noProgressTicks % 10 == 0) {
-            mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND,
-                new BlockHitResult(center, Direction.UP, chest, false));
-        }
+        // Look at the chest like a real player, then right-click what we're actually aiming at.
+        lookAt(chest);
+        HitResult hit = mc.player.raycast(4.5, 1f, false);
+        boolean aimed = hit instanceof BlockHitResult bhr && bhr.getBlockPos().equals(chest);
+        if (!aimed && ++chestLookTicks < 40) return;
+
+        if (openCooldown-- > 0) return;
+        openCooldown = 10;
+
+        say("Opening the ender chest.");
+        BlockHitResult use = aimed ? (BlockHitResult) hit : new BlockHitResult(center, Direction.UP, chest, false);
+        mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, use);
+        mc.player.swingHand(Hand.MAIN_HAND);
     }
 
     private BlockPos findPlaceSpot() {
@@ -395,11 +448,12 @@ public class SpawnerProtect extends Module {
         String msg = "[SpawnerProtect] Player detected (" + reason + ") - spawners secured.";
 
         ServerInfo server = mc.getCurrentServerEntry();
-        if (rejoinRecheck.get() && server == null) {
-            warning("Rejoin & recheck only works on multiplayer servers - skipping it.");
+        boolean wantRejoin = rejoinRecheck.get() || forceRejoin;
+        if (wantRejoin && server == null) {
+            warning("Rejoining only works on multiplayer servers - skipping it.");
         }
 
-        if (rejoinRecheck.get() && server != null && mc.getNetworkHandler() != null) {
+        if (wantRejoin && server != null && mc.getNetworkHandler() != null) {
             lastServer = server;
             rejoinTimer = rejoinDelay.get() * 20;
             connectTicks = 0;
@@ -426,6 +480,9 @@ public class SpawnerProtect extends Module {
                 info("Rejoined, checking for leftover spawners...");
                 waitTicks = 0;
                 ticksActive = 0;
+                skipped.clear();
+                retriedSkipped = false;
+                forceRejoin = false;
                 state = State.RECHECK;
             }
             return;
@@ -500,6 +557,18 @@ public class SpawnerProtect extends Module {
     }
 
     // ---------------------------------------------------------------- helpers
+
+    private void say(String message) {
+        if (!message.equals(lastMsg)) {
+            lastMsg = message;
+            info(message);
+        }
+    }
+
+    private boolean hasUnskippedSpawner() {
+        for (BlockPos p : findBlocks(spawnerRange.get(), true)) if (!skipped.contains(p)) return true;
+        return false;
+    }
 
     private ItemEntity nearestSpawnerDrop(double radius) {
         ItemEntity nearest = null;
