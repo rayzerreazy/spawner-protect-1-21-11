@@ -91,6 +91,10 @@ public class SpawnerProtect extends Module {
         .name("shulker-load").description("Break every placed shulker box too, and when your inventory is full put the spawners in a shulker box and store it in the ender chest.")
         .defaultValue(false).build());
 
+    private final Setting<Double> mineDelay = sg.add(new DoubleSetting.Builder()
+        .name("mine-delay").description("Seconds to wait after one spawner breaks before starting the next one.")
+        .defaultValue(0.1).min(0).sliderMax(2).decimalPlaces(2).build());
+
     private final Setting<Integer> attemptSeconds = sg.add(new IntSetting.Builder()
         .name("attempt-seconds").description("How long one attempt to break a block gets. After 2 failed attempts (anti-cheat) the block is skipped.")
         .defaultValue(5).min(2).sliderMax(20).build());
@@ -151,6 +155,7 @@ public class SpawnerProtect extends Module {
     private int handled; // blocks mined or given up on so far
     private BlockPos pendingBreak; // a block that vanished; waiting to see if the server really broke it
     private int pendingTicks;
+    private int delayTicks;
     private boolean retriedSkipped, chestOpenSeen, boxOpenSeen, shulkerDisabled, noRejoin, panicking;
     private boolean shulkersUnlocked, midRunDeposit;
     private final Set<Integer> ignoredDrops = new HashSet<>();
@@ -183,6 +188,7 @@ public class SpawnerProtect extends Module {
         handled = 0;
         pendingBreak = null;
         pendingTicks = 0;
+        delayTicks = 0;
         retriedSkipped = chestOpenSeen = boxOpenSeen = shulkerDisabled = noRejoin = panicking = false;
         shulkersUnlocked = midRunDeposit = false;
         packRounds = shulkerItemsBefore = collectTicks = 0;
@@ -288,6 +294,7 @@ public class SpawnerProtect extends Module {
             pendingBreak = mineTarget;
             pendingTicks = 0;
             mineTarget = null;
+            delayTicks = (int) Math.round(mineDelay.get() * 20); // 20 ticks per second
         }
 
         // A skipped block only gets another go after 2 other blocks were mined (or given up on).
@@ -299,6 +306,12 @@ public class SpawnerProtect extends Module {
                 attempts.remove(p);
                 if (isMineable(p)) say("Going back to the block at " + p.getX() + " " + p.getY() + " " + p.getZ() + ".");
             }
+        }
+
+        // Pause between blocks.
+        if (delayTicks > 0) {
+            delayTicks--;
+            return;
         }
 
         List<BlockPos> spawnersAll = findBlocks(spawnerRange.get(), true);
