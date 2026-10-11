@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -135,6 +136,8 @@ public class SpawnerProtect extends Module {
 
     private final Set<BlockPos> skipped = new HashSet<>();
     private final Map<BlockPos, Integer> attempts = new HashMap<>();
+    private final Map<BlockPos, Integer> skippedAt = new HashMap<>();
+    private int handled; // blocks mined or given up on so far
     private boolean retriedSkipped, chestOpenSeen, boxOpenSeen, shulkerDisabled, noRejoin, panicking;
     private boolean shulkersUnlocked, midRunDeposit;
     private final Set<Integer> ignoredDrops = new HashSet<>();
@@ -163,6 +166,8 @@ public class SpawnerProtect extends Module {
         lookTarget = mineTarget = shulkerPos = null;
         skipped.clear();
         attempts.clear();
+        skippedAt.clear();
+        handled = 0;
         retriedSkipped = chestOpenSeen = boxOpenSeen = shulkerDisabled = noRejoin = panicking = false;
         shulkersUnlocked = midRunDeposit = false;
         packRounds = shulkerItemsBefore = collectTicks = 0;
@@ -248,6 +253,24 @@ public class SpawnerProtect extends Module {
     private void mine() {
         if (maybeStartShulker(State.MINING)) return;
 
+        // Did the block we were working on break?
+        if (mineTarget != null && !isMineable(mineTarget)) {
+            handled++;
+            attempts.remove(mineTarget);
+            mineTarget = null;
+        }
+
+        // A skipped block only gets another go after 2 other blocks were mined (or given up on).
+        for (Iterator<BlockPos> it = skipped.iterator(); it.hasNext(); ) {
+            BlockPos p = it.next();
+            if (handled - skippedAt.getOrDefault(p, 0) >= 2) {
+                it.remove();
+                skippedAt.remove(p);
+                attempts.remove(p);
+                if (isMineable(p)) say("Going back to the block at " + p.getX() + " " + p.getY() + " " + p.getZ() + ".");
+            }
+        }
+
         List<BlockPos> spawnersAll = findBlocks(spawnerRange.get(), true);
         List<BlockPos> shulkersAll = (shulkerLoad.get() && shulkersUnlocked)
             ? findShulkerBlocks(spawnerRange.get()) : new ArrayList<>();
@@ -268,6 +291,7 @@ public class SpawnerProtect extends Module {
                     retriedSkipped = true;
                     skipped.clear();
                     attempts.clear();
+                    skippedAt.clear();
                     say("Everything else is done - trying the skipped block(s) once more.");
                     return;
                 }
@@ -321,8 +345,10 @@ public class SpawnerProtect extends Module {
             String where = target.getX() + " " + target.getY() + " " + target.getZ();
             if (n >= MAX_ATTEMPTS) {
                 skipped.add(target);
+                handled++;
+                skippedAt.put(target, handled);
                 mineTarget = null;
-                warning("Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - skipping it.");
+                warning("Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - skipping it until 2 other blocks are done.");
             } else {
                 warning("Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - trying again.");
             }
@@ -631,6 +657,8 @@ public class SpawnerProtect extends Module {
                 ticksActive = 0;
                 skipped.clear();
                 attempts.clear();
+                skippedAt.clear();
+                handled = 0;
                 ignoredDrops.clear();
                 retriedSkipped = false;
                 shulkersUnlocked = true;
@@ -895,6 +923,11 @@ public class SpawnerProtect extends Module {
     }
 
     // ---------------------------------------------------------------- helpers
+
+    private boolean isMineable(BlockPos pos) {
+        var b = mc.world.getBlockState(pos).getBlock();
+        return b == Blocks.SPAWNER || b instanceof ShulkerBoxBlock;
+    }
 
     private void say(String message) {
         if (!message.equals(lastMsg)) {
