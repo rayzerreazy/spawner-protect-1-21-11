@@ -58,10 +58,6 @@ public class SpawnerProtect extends Module {
         .name("detect-range").description("Range to detect other players. 0 = any loaded player.")
         .defaultValue(64).min(0).sliderMax(128).build());
 
-    private final Setting<Boolean> ignoreFriends = sg.add(new BoolSetting.Builder()
-        .name("ignore-friends").description("Friends never trigger the module.")
-        .defaultValue(true).build());
-
     private final Setting<List<String>> ignoredNames = sg.add(new StringListSetting.Builder()
         .name("ignored-players").description("Player names that never trigger the module.")
         .defaultValue(new ArrayList<>()).build());
@@ -70,32 +66,20 @@ public class SpawnerProtect extends Module {
         .name("spawner-range").description("How far to look for spawners.")
         .defaultValue(12).min(1).sliderMax(16).build());
 
-    private final Setting<Boolean> crouchWhileMining = sg.add(new BoolSetting.Builder()
-        .name("crouch-while-mining").description("Hold sneak while breaking spawners.")
-        .defaultValue(true).build());
-
-    private final Setting<Boolean> doubleCheck = sg.add(new BoolSetting.Builder()
-        .name("double-check").description("Before storing, re-scan for spawners still placed or still on the ground.")
-        .defaultValue(true).build());
-
     private final Setting<Integer> depositDelay = sg.add(new IntSetting.Builder()
         .name("deposit-delay").description("Ticks between each shift-click into the ender chest.")
         .defaultValue(2).min(0).sliderMax(10).build());
 
-    private final Setting<Boolean> lookAtSpawner = sg.add(new BoolSetting.Builder()
-        .name("look-at-spawner").description("Turn your camera to face the spawner and only start mining once you're actually looking at it.")
-        .defaultValue(true).build());
-
     private final Setting<Integer> lookSpeed = sg.add(new IntSetting.Builder()
         .name("look-speed").description("Max degrees your view turns per tick when facing a spawner.")
-        .defaultValue(25).min(1).sliderMax(90).visible(lookAtSpawner::get).build());
+        .defaultValue(25).min(1).sliderMax(90).build());
 
     private final Setting<Integer> skipTimeout = sg.add(new IntSetting.Builder()
         .name("skip-timeout").description("If a spawner can't be broken within this many seconds (anti-cheat), skip it, mine the rest, then try it once more. If it still fails, store the rest, leave and rejoin.")
         .defaultValue(10).min(2).sliderMax(30).build());
 
     private final Setting<Boolean> rotate = sg.add(new BoolSetting.Builder()
-        .name("rotate").description("Silent rotation for placing the ender chest (and for mining when look-at-spawner is off).")
+        .name("rotate").description("Silent rotation when placing the ender chest.")
         .defaultValue(true).build());
 
     private final Setting<Integer> timeout = sg.add(new IntSetting.Builder()
@@ -198,7 +182,7 @@ public class SpawnerProtect extends Module {
     private PlayerEntity findIntruder() {
         for (PlayerEntity p : mc.world.getPlayers()) {
             if (p == mc.player || p.isSpectator()) continue;
-            if (ignoreFriends.get() && Friends.get().isFriend(p)) continue;
+            if (Friends.get().isFriend(p)) continue;
             String name = p.getName().getString();
             if (ignoredNames.get().stream().anyMatch(n -> n.equalsIgnoreCase(name))) continue;
             if (detectRange.get() > 0 && mc.player.distanceTo(p) > detectRange.get()) continue;
@@ -247,23 +231,21 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        if (crouchWhileMining.get()) mc.options.sneakKey.setPressed(true);
+        mc.options.sneakKey.setPressed(true);
 
         if (!target.equals(mineTarget)) {
             mineTarget = target;
             mineTicks = 0;
         }
 
-        if (lookAtSpawner.get()) {
-            if (!target.equals(lookTarget)) {
-                lookTarget = target;
-                lookTicks = 0;
-            }
-            lookAt(target);
-            // Wait until the crosshair is on the spawner. If something is in the way
-            // and it never lines up, stop waiting after 2 seconds and mine anyway.
-            if (!isLookingAt(target) && ++lookTicks < 40) return;
+        if (!target.equals(lookTarget)) {
+            lookTarget = target;
+            lookTicks = 0;
         }
+        lookAt(target);
+        // Wait until the crosshair is on the spawner. If something is in the way
+        // and it never lines up, stop waiting after 2 seconds and mine anyway.
+        if (!isLookingAt(target) && ++lookTicks < 40) return;
 
         // Anti-cheat sometimes refuses one spawner: give up on it for now.
         if (++mineTicks > skipTimeout.get() * 20) {
@@ -273,12 +255,7 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        if (lookAtSpawner.get() || !rotate.get()) {
-            BlockUtils.breakBlock(target, true);
-        } else {
-            Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target),
-                () -> BlockUtils.breakBlock(target, true));
-        }
+        BlockUtils.breakBlock(target, true);
     }
 
     private void lookAt(BlockPos pos) {
@@ -311,7 +288,7 @@ public class SpawnerProtect extends Module {
         // Drops can take a moment to appear / get picked up.
         if (++waitTicks < 15) return;
 
-        if (doubleCheck.get() && verifyPasses < MAX_VERIFY_PASSES) {
+        if (verifyPasses < MAX_VERIFY_PASSES) {
             waitTicks = 0;
             state = State.VERIFY;
             return;
