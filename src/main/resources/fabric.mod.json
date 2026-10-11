@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "addon-template",
   "version": "${version}",
-  "name": "Addon Template",
+  "name": "Ray's Addon",
   "description": "An addon template for Meteor Client addons.",
   "authors": [
     "seasnail"
