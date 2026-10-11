@@ -11,6 +11,10 @@ import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Blocks;
+import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
+import net.minecraft.client.network.ServerAddress;
+import net.minecraft.client.network.ServerInfo;
 import net.minecraft.enchantment.Enchantment;
 import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.ItemEntity;
@@ -23,8 +27,10 @@ import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
@@ -74,8 +80,17 @@ public class SpawnerProtect extends Module {
         .name("deposit-delay").description("Ticks between each shift-click into the ender chest.")
         .defaultValue(2).min(0).sliderMax(10).build());
 
+    private final Setting<Boolean> lookAtSpawner = sg.add(new BoolSetting.Builder()
+        .name("look-at-spawner").description("Turn your camera to face the spawner and only start mining once you're actually looking at it.")
+        .defaultValue(true).build());
+
+    private final Setting<Integer> lookSpeed = sg.add(new IntSetting.Builder()
+        .name("look-speed").description("Max degrees your view turns per tick when facing a spawner.")
+        .defaultValue(25).min(1).sliderMax(90).visible(lookAtSpawner::get).build());
+
     private final Setting<Boolean> rotate = sg.add(new BoolSetting.Builder()
-        .name("rotate").description("Look at blocks when breaking/placing.").defaultValue(true).build());
+        .name("rotate").description("Silent rotation for placing the ender chest (and for mining when look-at-spawner is off).")
+        .defaultValue(true).build());
 
     private final Setting<Integer> timeout = sg.add(new IntSetting.Builder()
         .name("timeout-seconds").description("Safety: disconnect after this long even if not finished. 0 = off.")
@@ -85,11 +100,27 @@ public class SpawnerProtect extends Module {
         .name("disconnect-when-done").description("Leave the server when finished.")
         .defaultValue(true).build());
 
-    private enum State { IDLE, MINING, COLLECTING, VERIFY, DEPOSIT, LEAVE }
+    private final Setting<Boolean> rejoinRecheck = sg.add(new BoolSetting.Builder()
+        .name("rejoin-and-recheck").description("After storing the spawners and leaving, rejoin the server and check again for spawners left. Repeats if any are found.")
+        .defaultValue(false).build());
+
+    private final Setting<Integer> rejoinDelay = sg.add(new IntSetting.Builder()
+        .name("rejoin-delay").description("Seconds to wait before rejoining.")
+        .defaultValue(8).min(1).sliderMax(60).visible(rejoinRecheck::get).build());
+
+    private final Setting<Integer> maxRounds = sg.add(new IntSetting.Builder()
+        .name("max-recheck-rounds").description("Give up after this many leave/rejoin/recheck rounds.")
+        .defaultValue(3).min(1).sliderMax(10).visible(rejoinRecheck::get).build());
+
+    private enum State { IDLE, MINING, COLLECTING, VERIFY, DEPOSIT, LEAVE, REJOIN_WAIT, REJOINING, RECHECK }
 
     private State state = State.IDLE;
     private int ticksActive, waitTicks, actionTimer, noProgressTicks, verifyPasses;
     private String reason = "";
+    private ServerInfo lastServer;
+    private BlockPos lookTarget;
+    private int lookTicks;
+    private int rejoinTimer, connectTicks, connectAttempts, rounds;
 
     public SpawnerProtect() {
         super(AddonTemplate.CATEGORY, "spawner-protect",
@@ -105,10 +136,19 @@ public class SpawnerProtect extends Module {
     private void reset() {
         state = State.IDLE;
         ticksActive = waitTicks = actionTimer = noProgressTicks = verifyPasses = 0;
+        rejoinTimer = connectTicks = connectAttempts = rounds = 0;
+        lastServer = null;
+        lookTarget = null;
+        lookTicks = 0;
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        if (state == State.REJOIN_WAIT || state == State.REJOINING) {
+            handleRejoin();
+            return;
+        }
+
         if (mc.player == null || mc.world == null) return;
 
         // Only take over the movement keys once we're actually working,
@@ -136,6 +176,8 @@ public class SpawnerProtect extends Module {
             case VERIFY -> verify();
             case DEPOSIT -> deposit();
             case LEAVE -> leave();
+            case RECHECK -> recheck();
+            default -> { }
         }
     }
 
@@ -181,12 +223,42 @@ public class SpawnerProtect extends Module {
 
         if (crouchWhileMining.get()) mc.options.sneakKey.setPressed(true);
 
+        if (lookAtSpawner.get()) {
+            if (!target.equals(lookTarget)) {
+                lookTarget = target;
+                lookTicks = 0;
+            }
+            lookAt(target);
+            // Wait until the crosshair is on the spawner. If something is in the way
+            // and it never lines up, stop waiting after 2 seconds and mine anyway.
+            if (!isLookingAt(target) && ++lookTicks < 40) return;
+            BlockUtils.breakBlock(target, true);
+            return;
+        }
+
         if (rotate.get()) {
             Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target),
                 () -> BlockUtils.breakBlock(target, true));
         } else {
             BlockUtils.breakBlock(target, true);
         }
+    }
+
+    private void lookAt(BlockPos pos) {
+        float targetYaw = (float) Rotations.getYaw(pos);
+        float targetPitch = (float) Rotations.getPitch(pos);
+        float max = lookSpeed.get();
+
+        float dYaw = MathHelper.wrapDegrees(targetYaw - mc.player.getYaw());
+        float dPitch = targetPitch - mc.player.getPitch();
+
+        mc.player.setYaw(mc.player.getYaw() + MathHelper.clamp(dYaw, -max, max));
+        mc.player.setPitch(MathHelper.clamp(mc.player.getPitch() + MathHelper.clamp(dPitch, -max, max), -90f, 90f));
+    }
+
+    private boolean isLookingAt(BlockPos pos) {
+        HitResult hit = mc.player.raycast(4.5, 1f, false);
+        return hit instanceof BlockHitResult bhr && bhr.getBlockPos().equals(pos);
     }
 
     // ---------------------------------------------------------------- collecting
@@ -321,12 +393,110 @@ public class SpawnerProtect extends Module {
         if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler) mc.player.closeHandledScreen();
 
         String msg = "[SpawnerProtect] Player detected (" + reason + ") - spawners secured.";
+
+        ServerInfo server = mc.getCurrentServerEntry();
+        if (rejoinRecheck.get() && server == null) {
+            warning("Rejoin & recheck only works on multiplayer servers - skipping it.");
+        }
+
+        if (rejoinRecheck.get() && server != null && mc.getNetworkHandler() != null) {
+            lastServer = server;
+            rejoinTimer = rejoinDelay.get() * 20;
+            connectTicks = 0;
+            connectAttempts = 0;
+            state = State.REJOIN_WAIT;
+            mc.getNetworkHandler().getConnection().disconnect(Text.literal(msg));
+            return;
+        }
+
         if (disconnect.get() && mc.getNetworkHandler() != null) {
             mc.getNetworkHandler().getConnection().disconnect(Text.literal(msg));
         } else {
             info(msg);
         }
         toggle();
+    }
+
+    // ---------------------------------------------------------------- rejoin + recheck
+
+    private void handleRejoin() {
+        // Already back in the world -> start checking.
+        if (mc.player != null && mc.world != null) {
+            if (state == State.REJOINING) {
+                info("Rejoined, checking for leftover spawners...");
+                waitTicks = 0;
+                ticksActive = 0;
+                state = State.RECHECK;
+            }
+            return;
+        }
+
+        if (state == State.REJOIN_WAIT) {
+            if (--rejoinTimer > 0) return;
+            connect();
+            state = State.REJOINING;
+            return;
+        }
+
+        // REJOINING: still connecting. Retry every 30 seconds if it hasn't worked.
+        if (++connectTicks > 600) {
+            if (connectAttempts >= 10) {
+                warning("Couldn't rejoin after 10 tries, giving up.");
+                toggle();
+                return;
+            }
+            connect();
+        }
+    }
+
+    private void connect() {
+        connectTicks = 0;
+        connectAttempts++;
+        if (lastServer == null) {
+            toggle();
+            return;
+        }
+        ConnectScreen.connect(new TitleScreen(), mc, ServerAddress.parse(lastServer.address), lastServer, false, null);
+    }
+
+    private void recheck() {
+        if (++waitTicks < 100) return; // let chunks and entities load
+
+        if (!findBlocks(spawnerRange.get(), true).isEmpty()) {
+            if (!nextRound("A spawner is still placed")) return;
+            state = State.MINING;
+            return;
+        }
+
+        if (nearestSpawnerDrop(spawnerRange.get() + 8) != null) {
+            if (!nextRound("A spawner is still on the ground")) return;
+            waitTicks = 0;
+            state = State.COLLECTING;
+            return;
+        }
+
+        if (countSpawners() > 0) {
+            if (!nextRound("Spawners are still in your inventory")) return;
+            noProgressTicks = 0;
+            state = State.DEPOSIT;
+            return;
+        }
+
+        info("Recheck passed: no spawners left. All done.");
+        toggle();
+    }
+
+    private boolean nextRound(String why) {
+        rounds++;
+        if (rounds > maxRounds.get()) {
+            warning(why + ", but the max number of rounds was reached. Stopping.");
+            toggle();
+            return false;
+        }
+        warning(why + " - going again (round " + rounds + "/" + maxRounds.get() + ").");
+        verifyPasses = 0;
+        ticksActive = 0;
+        return true;
     }
 
     // ---------------------------------------------------------------- helpers
