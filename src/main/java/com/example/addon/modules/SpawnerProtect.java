@@ -12,12 +12,12 @@ import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.ShulkerBoxBlock;
-import net.minecraft.component.DataComponentTypes;
-import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.enchantment.Enchantment;
 import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.ItemEntity;
@@ -40,22 +40,25 @@ import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
  * Spawner Protect (Meteor Client addon module, Fabric 1.21.11, Yarn mappings)
  *
- * Flow: detect player -> mine every spawner nearby (crouching, silk touch pickaxe in hotbar)
- *       -> walk over and collect the drops -> double check nothing was missed
- *       -> put them in your ender chest -> disconnect.
+ * Flow: player shows up -> mine every spawner (and, with shulker-load, every placed shulker box)
+ *       -> collect the drops -> double check -> store everything in the ender chest -> leave
+ *       -> rejoin -> check again -> repeat if anything is left, otherwise turn off and leave.
  *
- * Requirements: silk touch pickaxe in hotbar. An ender chest either already placed
- * nearby, or an ender chest item in your hotbar (the module will place one).
+ * If another player gets within panic-range while it's working, it stores whatever it has
+ * picked up in the ender chest and leaves immediately.
  */
 public class SpawnerProtect extends Module {
     private static final int MAX_VERIFY_PASSES = 3;
+    private static final int MAX_ATTEMPTS = 2;
 
     private final SettingGroup sg = settings.getDefaultGroup();
 
@@ -68,65 +71,69 @@ public class SpawnerProtect extends Module {
         .defaultValue(new ArrayList<>()).build());
 
     private final Setting<Integer> spawnerRange = sg.add(new IntSetting.Builder()
-        .name("spawner-range").description("How far to look for spawners.")
+        .name("spawner-range").description("How far to look for spawners and shulker boxes.")
         .defaultValue(12).min(1).sliderMax(16).build());
 
+    private final Setting<Integer> panicRange = sg.add(new IntSetting.Builder()
+        .name("panic-range").description("If another player gets this close while working, store everything you picked up in the ender chest and leave right away. 0 = off.")
+        .defaultValue(5).min(0).sliderMax(16).build());
+
     private final Setting<Integer> depositDelay = sg.add(new IntSetting.Builder()
-        .name("deposit-delay").description("Ticks between each shift-click into the ender chest.")
+        .name("deposit-delay").description("Ticks between each shift-click into a chest or shulker box.")
         .defaultValue(2).min(0).sliderMax(10).build());
 
-    private final Setting<Integer> lookSpeed = sg.add(new IntSetting.Builder()
-        .name("look-speed").description("Max degrees your view turns per tick when facing a spawner.")
-        .defaultValue(25).min(1).sliderMax(90).build());
-
     private final Setting<Boolean> shulkerLoad = sg.add(new BoolSetting.Builder()
-        .name("shulker-load").description("When your inventory is full, put the spawners in a shulker box (a placed one nearby, or one from your hotbar), break it, store it in the ender chest, then carry on.")
+        .name("shulker-load").description("Break every placed shulker box too, and when your inventory is full put the spawners in a shulker box and store it in the ender chest.")
         .defaultValue(false).build());
 
-    private final Setting<Integer> skipTimeout = sg.add(new IntSetting.Builder()
-        .name("skip-timeout").description("If a spawner can't be broken within this many seconds (anti-cheat), skip it, mine the rest, then try it once more. If it still fails, store the rest, leave and rejoin.")
-        .defaultValue(10).min(2).sliderMax(30).build());
+    private final Setting<Integer> attemptSeconds = sg.add(new IntSetting.Builder()
+        .name("attempt-seconds").description("How long one attempt to break a block gets. After 2 failed attempts (anti-cheat) the block is skipped.")
+        .defaultValue(5).min(2).sliderMax(20).build());
+
+    private final Setting<Integer> lookSpeed = sg.add(new IntSetting.Builder()
+        .name("look-speed").description("Max degrees your view turns per tick when facing a block.")
+        .defaultValue(25).min(1).sliderMax(90).build());
 
     private final Setting<Boolean> rotate = sg.add(new BoolSetting.Builder()
-        .name("rotate").description("Silent rotation when placing the ender chest.")
+        .name("rotate").description("Silent rotation when placing the ender chest or a shulker box.")
         .defaultValue(true).build());
 
     private final Setting<Integer> timeout = sg.add(new IntSetting.Builder()
-        .name("timeout-seconds").description("Safety: disconnect after this long even if not finished. 0 = off.")
+        .name("timeout-seconds").description("Safety: store everything and leave after this long even if not finished. 0 = off.")
         .defaultValue(180).min(0).sliderMax(600).build());
-
-    private final Setting<Boolean> disconnect = sg.add(new BoolSetting.Builder()
-        .name("disconnect-when-done").description("Leave the server when finished.")
-        .defaultValue(true).build());
-
-    private final Setting<Boolean> rejoinRecheck = sg.add(new BoolSetting.Builder()
-        .name("rejoin-and-recheck").description("After storing the spawners and leaving, rejoin the server and check again for spawners left. Repeats if any are found.")
-        .defaultValue(false).build());
 
     private final Setting<Integer> rejoinDelay = sg.add(new IntSetting.Builder()
         .name("rejoin-delay").description("Seconds to wait before rejoining.")
-        .defaultValue(8).min(1).sliderMax(60).visible(rejoinRecheck::get).build());
+        .defaultValue(8).min(1).sliderMax(60).build());
 
     private final Setting<Integer> maxRounds = sg.add(new IntSetting.Builder()
-        .name("max-recheck-rounds").description("Give up after this many leave/rejoin/recheck rounds.")
-        .defaultValue(3).min(1).sliderMax(10).visible(rejoinRecheck::get).build());
+        .name("max-recheck-rounds").description("Give up (and leave for good) after this many leave/rejoin/recheck rounds.")
+        .defaultValue(3).min(1).sliderMax(10).build());
 
-    private enum State { IDLE, MINING, COLLECTING, VERIFY, DEPOSIT, LEAVE, REJOIN_WAIT, REJOINING, RECHECK, SHULKER_LOAD, SHULKER_BREAK, SHULKER_COLLECT }
+    private enum State {
+        IDLE, MINING, COLLECTING, VERIFY, DEPOSIT, LEAVE, REJOIN_WAIT, REJOINING, RECHECK,
+        SHULKER_LOAD, SHULKER_BREAK, SHULKER_COLLECT
+    }
+
+    /** What the next ender chest deposit should move. */
+    private enum Dep { ALL, LOADED_SHULKERS }
 
     private State state = State.IDLE;
-    private int ticksActive, waitTicks, actionTimer, noProgressTicks, verifyPasses;
-    private String reason = "";
-    private ServerInfo lastServer;
-    private BlockPos lookTarget, mineTarget;
-    private int lookTicks, mineTicks, openCooldown, chestLookTicks;
-    private final Set<BlockPos> skipped = new HashSet<>();
-    private boolean retriedSkipped, forceRejoin, chestOpenSeen;
-    private String lastMsg = "";
     private State resumeState = State.MINING;
-    private boolean shulkerDisabled, depositingShulkers, boxOpenSeen;
-    private BlockPos shulkerPos;
-    private int shulkerTicks, shulkersStored;
+    private Dep depMode = Dep.ALL;
+
+    private int ticksActive, waitTicks, actionTimer, noProgressTicks, verifyPasses, lastCount;
+    private int lookTicks, mineTicks, openCooldown, chestLookTicks, shulkerTicks, shulkersStored;
     private int rejoinTimer, connectTicks, connectAttempts, rounds;
+
+    private String reason = "";
+    private String lastMsg = "";
+    private ServerInfo lastServer;
+    private BlockPos lookTarget, mineTarget, shulkerPos;
+
+    private final Set<BlockPos> skipped = new HashSet<>();
+    private final Map<BlockPos, Integer> attempts = new HashMap<>();
+    private boolean retriedSkipped, chestOpenSeen, boxOpenSeen, shulkerDisabled, noRejoin, panicking;
 
     public SpawnerProtect() {
         super(AddonTemplate.CATEGORY, "spawner-protect",
@@ -141,18 +148,18 @@ public class SpawnerProtect extends Module {
 
     private void reset() {
         state = State.IDLE;
-        ticksActive = waitTicks = actionTimer = noProgressTicks = verifyPasses = 0;
-        rejoinTimer = connectTicks = connectAttempts = rounds = 0;
-        lastServer = null;
-        lookTarget = mineTarget = null;
-        lookTicks = mineTicks = openCooldown = chestLookTicks = 0;
-        skipped.clear();
-        retriedSkipped = forceRejoin = chestOpenSeen = false;
-        lastMsg = "";
         resumeState = State.MINING;
-        shulkerDisabled = depositingShulkers = boxOpenSeen = false;
-        shulkerPos = null;
-        shulkerTicks = shulkersStored = 0;
+        depMode = Dep.ALL;
+        ticksActive = waitTicks = actionTimer = noProgressTicks = verifyPasses = lastCount = 0;
+        lookTicks = mineTicks = openCooldown = chestLookTicks = shulkerTicks = shulkersStored = 0;
+        rejoinTimer = connectTicks = connectAttempts = rounds = 0;
+        reason = "";
+        lastMsg = "";
+        lastServer = null;
+        lookTarget = mineTarget = shulkerPos = null;
+        skipped.clear();
+        attempts.clear();
+        retriedSkipped = chestOpenSeen = boxOpenSeen = shulkerDisabled = noRejoin = panicking = false;
     }
 
     @EventHandler
@@ -169,15 +176,25 @@ public class SpawnerProtect extends Module {
         if (state != State.IDLE) {
             stopWalking();
             ticksActive++;
-            if (timeout.get() > 0 && ticksActive > timeout.get() * 20 && state != State.LEAVE) {
-                warning("Timed out, leaving.");
-                state = State.LEAVE;
+            if (timeout.get() > 0 && ticksActive > timeout.get() * 20
+                && state != State.LEAVE && state != State.DEPOSIT) {
+                storeAndLeave("Timed out - storing everything and leaving.", true);
+            }
+        }
+
+        // Panic: someone is right next to us while we're working.
+        if (panicRange.get() > 0 && isWorking()) {
+            PlayerEntity close = findIntruder(panicRange.get());
+            if (close != null) {
+                reason = close.getName().getString();
+                storeAndLeave("Player " + reason + " is within " + panicRange.get()
+                    + " blocks - storing everything and leaving!", true);
             }
         }
 
         switch (state) {
             case IDLE -> {
-                PlayerEntity p = findIntruder();
+                PlayerEntity p = findIntruder(detectRange.get());
                 if (p != null) {
                     reason = p.getName().getString();
                     info("Player detected: " + reason + " - securing spawners.");
@@ -197,15 +214,22 @@ public class SpawnerProtect extends Module {
         }
     }
 
+    private boolean isWorking() {
+        return switch (state) {
+            case MINING, COLLECTING, VERIFY, RECHECK, SHULKER_LOAD, SHULKER_BREAK, SHULKER_COLLECT -> true;
+            default -> false;
+        };
+    }
+
     // ---------------------------------------------------------------- detection
 
-    private PlayerEntity findIntruder() {
+    private PlayerEntity findIntruder(int range) {
         for (PlayerEntity p : mc.world.getPlayers()) {
             if (p == mc.player || p.isSpectator()) continue;
             if (Friends.get().isFriend(p)) continue;
             String name = p.getName().getString();
             if (ignoredNames.get().stream().anyMatch(n -> n.equalsIgnoreCase(name))) continue;
-            if (detectRange.get() > 0 && mc.player.distanceTo(p) > detectRange.get()) continue;
+            if (range > 0 && mc.player.distanceTo(p) > range) continue;
             return p;
         }
         return null;
@@ -216,36 +240,47 @@ public class SpawnerProtect extends Module {
     private void mine() {
         if (maybeStartShulker(State.MINING)) return;
 
-        List<BlockPos> all = findBlocks(spawnerRange.get(), true);
-        List<BlockPos> spawners = new ArrayList<>();
-        for (BlockPos p : all) if (!skipped.contains(p)) spawners.add(p);
+        List<BlockPos> spawnersAll = findBlocks(spawnerRange.get(), true);
+        List<BlockPos> shulkersAll = shulkerLoad.get() ? findShulkerBlocks(spawnerRange.get()) : new ArrayList<>();
 
-        if (spawners.isEmpty()) {
-            if (!all.isEmpty()) {
-                // Only spawners that failed earlier are left.
+        // Spawners first, then (with shulker-load) every placed shulker box.
+        List<BlockPos> targets = unskipped(spawnersAll);
+        boolean shulkerTarget = false;
+        if (targets.isEmpty()) {
+            targets = unskipped(shulkersAll);
+            shulkerTarget = !targets.isEmpty();
+        }
+
+        if (targets.isEmpty()) {
+            int stuck = spawnersAll.size() + shulkersAll.size();
+            if (stuck > 0) {
+                // Only blocks that failed earlier are left: give them one more go.
                 if (!retriedSkipped) {
                     retriedSkipped = true;
                     skipped.clear();
-                    say("Everything else is mined - retrying the spawner(s) that failed.");
+                    attempts.clear();
+                    say("Everything else is done - trying the skipped block(s) once more.");
                     return;
                 }
-                forceRejoin = true;
-                warning("Couldn't mine " + all.size() + " spawner(s) (anti-cheat?). Storing the rest, then leaving and rejoining.");
+                warning("Couldn't break " + stuck + " block(s) after " + MAX_ATTEMPTS + " attempts each (anti-cheat?). Skipping them.");
             }
             waitTicks = 0;
             state = State.COLLECTING;
             return;
         }
 
-        FindItemResult pick = InvUtils.findInHotbar(s -> s.isIn(ItemTags.PICKAXES) && hasSilkTouch(s));
-        if (!pick.found()) {
+        final boolean forShulker = shulkerTarget;
+        FindItemResult pick = InvUtils.findInHotbar(s -> s.isIn(ItemTags.PICKAXES) && (forShulker || hasSilkTouch(s)));
+        if (pick.found()) {
+            InvUtils.swap(pick.slot(), false);
+        } else if (!forShulker) {
             error("No silk touch pickaxe in hotbar!");
+            noRejoin = true;
             state = State.LEAVE;
             return;
         }
-        InvUtils.swap(pick.slot(), false);
 
-        BlockPos target = spawners.get(0);
+        BlockPos target = targets.get(0);
         Vec3d center = Vec3d.ofCenter(target);
 
         if (mc.player.getEyePos().distanceTo(center) > 4.3) {
@@ -253,7 +288,7 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        mc.options.sneakKey.setPressed(true);
+        if (!forShulker) mc.options.sneakKey.setPressed(true); // crouch while breaking spawners
 
         if (!target.equals(mineTarget)) {
             mineTarget = target;
@@ -265,18 +300,27 @@ public class SpawnerProtect extends Module {
             lookTicks = 0;
         }
         lookAt(target);
-        // Wait until the crosshair is on the spawner. If something is in the way
+        // Wait until the crosshair is on the block. If something is in the way
         // and it never lines up, stop waiting after 2 seconds and mine anyway.
         if (!isLookingAt(target) && ++lookTicks < 40) return;
 
-        // Anti-cheat sometimes refuses one spawner: give up on it for now.
-        if (++mineTicks > skipTimeout.get() * 20) {
-            skipped.add(target);
-            mineTarget = null;
-            warning("Couldn't break the spawner at " + target.getX() + " " + target.getY() + " " + target.getZ() + " - skipping it for now.");
+        // One attempt = attempt-seconds of trying. After 2 failed attempts, skip the block.
+        if (++mineTicks > attemptSeconds.get() * 20) {
+            int n = attempts.merge(target, 1, Integer::sum);
+            mineTicks = 0;
+            lookTicks = 0;
+            String where = target.getX() + " " + target.getY() + " " + target.getZ();
+            if (n >= MAX_ATTEMPTS) {
+                skipped.add(target);
+                mineTarget = null;
+                warning("Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - skipping it.");
+            } else {
+                warning("Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - trying again.");
+            }
             return;
         }
 
+        if (forShulker) say("Breaking a shulker box.");
         BlockUtils.breakBlock(target, true);
     }
 
@@ -300,7 +344,7 @@ public class SpawnerProtect extends Module {
     // ---------------------------------------------------------------- collecting
 
     private void collect() {
-        ItemEntity nearest = nearestSpawnerDrop(spawnerRange.get() + 4);
+        ItemEntity nearest = nearestDrop(spawnerRange.get() + 4);
         if (nearest != null) {
             if (maybeStartShulker(State.COLLECTING)) return;
             waitTicks = 0;
@@ -324,72 +368,93 @@ public class SpawnerProtect extends Module {
     private void verify() {
         if (++waitTicks < 20) return; // give the server a second to settle
 
-        if (hasUnskippedSpawner()) {
+        if (hasUnskippedTarget()) {
             verifyPasses++;
-            warning("Double check: a spawner is still placed, mining it (" + verifyPasses + "/" + MAX_VERIFY_PASSES + ").");
+            warning("Double check: something is still placed, mining it (" + verifyPasses + "/" + MAX_VERIFY_PASSES + ").");
             state = State.MINING;
             return;
         }
 
-        if (nearestSpawnerDrop(spawnerRange.get() + 8) != null) {
+        if (nearestDrop(spawnerRange.get() + 8) != null) {
             verifyPasses++;
-            warning("Double check: a spawner is still on the ground, collecting it (" + verifyPasses + "/" + MAX_VERIFY_PASSES + ").");
+            warning("Double check: something is still on the ground, collecting it (" + verifyPasses + "/" + MAX_VERIFY_PASSES + ").");
             waitTicks = 0;
             state = State.COLLECTING;
             return;
         }
 
-        info("Double check passed: no spawners left nearby.");
+        info("Double check passed: nothing left nearby.");
         finishPickup();
     }
 
     private void finishPickup() {
-        if (countSpawners() > 0) {
-            noProgressTicks = 0;
-            depositingShulkers = false;
-            state = State.DEPOSIT;
+        depMode = Dep.ALL;
+        if (countDeposit() > 0) {
+            startDeposit();
         } else if (shulkersStored > 0) {
-            info("Everything is stored in shulker boxes in your ender chest.");
+            info("Everything is already stored in the ender chest.");
             state = State.LEAVE;
         } else {
-            warning("No spawners found in inventory.");
+            warning("Nothing to store.");
             state = State.LEAVE;
         }
     }
 
     // ---------------------------------------------------------------- ender chest
 
+    private void startDeposit() {
+        noProgressTicks = 0;
+        openCooldown = 0;
+        chestLookTicks = 0;
+        chestOpenSeen = false;
+        state = State.DEPOSIT;
+    }
+
     private void deposit() {
         if (countDeposit() == 0) {
             if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler) mc.player.closeHandledScreen();
-            if (depositingShulkers) {
-                depositingShulkers = false;
+            if (depMode == Dep.LOADED_SHULKERS) {
+                depMode = Dep.ALL;
                 shulkersStored++;
                 info("Loaded shulker box stored in the ender chest - carrying on.");
                 waitTicks = 0;
                 state = resumeState;
                 return;
             }
-            info("All spawners stored.");
+            info("Everything stored in the ender chest.");
             state = State.LEAVE;
             return;
         }
 
-        // Chest GUI is open -> shift-click spawners in.
+        // Chest GUI is open -> shift-click everything in.
         if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler handler) {
             if (!chestOpenSeen) {
                 chestOpenSeen = true;
                 actionTimer = 5; // short pause so the server and client agree on the contents
-                say(depositingShulkers ? "Ender chest open - moving the loaded shulker in." : "Ender chest open - moving spawners in.");
+                lastCount = countDeposit();
+                noProgressTicks = 0;
+                say("Ender chest open - storing everything.");
             }
             if (actionTimer-- > 0) return;
             actionTimer = depositDelay.get();
+
+            // Nothing is moving any more -> the chest is full (or refusing).
+            int now = countDeposit();
+            if (now != lastCount) {
+                lastCount = now;
+                noProgressTicks = 0;
+            } else if (++noProgressTicks > 40) {
+                warning("The ender chest isn't taking any more items (full?).");
+                mc.player.closeHandledScreen();
+                noRejoin = true;
+                state = State.LEAVE;
+                return;
+            }
 
             int chestSlots = handler.getRows() * 9;
             for (int i = chestSlots; i < handler.slots.size(); i++) {
                 if (shouldDeposit(handler.getSlot(i).getStack())) {
                     InvUtils.shiftClick().slotId(i);
-                    noProgressTicks = 0;
                     return;
                 }
             }
@@ -397,8 +462,8 @@ public class SpawnerProtect extends Module {
         }
         chestOpenSeen = false;
 
-        if (++noProgressTicks > 300) {
-            warning("Couldn't deposit everything (couldn't open the ender chest, or it's full).");
+        if (++noProgressTicks > (panicking ? 200 : 300)) {
+            warning("Couldn't open the ender chest.");
             state = State.LEAVE;
             return;
         }
@@ -408,6 +473,7 @@ public class SpawnerProtect extends Module {
             FindItemResult ec = InvUtils.findInHotbar(Items.ENDER_CHEST);
             if (!ec.found()) {
                 error("No ender chest nearby and none in hotbar.");
+                noRejoin = true;
                 state = State.LEAVE;
                 return;
             }
@@ -451,36 +517,55 @@ public class SpawnerProtect extends Module {
         return null;
     }
 
+    // ---------------------------------------------------------------- panic / abort
+
+    /** Stop what we're doing, put everything we carry in the ender chest, then leave. */
+    private void storeAndLeave(String why, boolean allowRejoin) {
+        warning(why);
+        noRejoin = !allowRejoin;
+        panicking = true;
+        stopWalking();
+        if (mc.player.currentScreenHandler instanceof ShulkerBoxScreenHandler) mc.player.closeHandledScreen();
+        depMode = Dep.ALL;
+        if (countDeposit() > 0) {
+            startDeposit();
+        } else {
+            state = State.LEAVE;
+        }
+    }
+
     // ---------------------------------------------------------------- leaving
 
     private void leave() {
         stopWalking();
-        if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler) mc.player.closeHandledScreen();
+        if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler
+            || mc.player.currentScreenHandler instanceof ShulkerBoxScreenHandler) mc.player.closeHandledScreen();
 
-        String msg = "[SpawnerProtect] Player detected (" + reason + ") - spawners secured.";
+        String msg = "[SpawnerProtect] " + (reason.isEmpty() ? "" : "Player detected (" + reason + ") - ")
+            + "everything secured.";
 
         ServerInfo server = mc.getCurrentServerEntry();
-        boolean wantRejoin = rejoinRecheck.get() || forceRejoin;
-        if (wantRejoin && server == null) {
-            warning("Rejoining only works on multiplayer servers - skipping it.");
-        }
-
-        if (wantRejoin && server != null && mc.getNetworkHandler() != null) {
+        if (!noRejoin && server != null && mc.getNetworkHandler() != null) {
             lastServer = server;
             rejoinTimer = rejoinDelay.get() * 20;
             connectTicks = 0;
             connectAttempts = 0;
             state = State.REJOIN_WAIT;
-            mc.getNetworkHandler().getConnection().disconnect(Text.literal(msg));
+            disconnect(msg);
             return;
         }
 
-        if (disconnect.get() && mc.getNetworkHandler() != null) {
+        if (!noRejoin) warning("Rejoining only works on multiplayer servers - leaving for good.");
+        disconnect(msg);
+        toggle();
+    }
+
+    private void disconnect(String msg) {
+        if (mc.getNetworkHandler() != null) {
             mc.getNetworkHandler().getConnection().disconnect(Text.literal(msg));
         } else {
             info(msg);
         }
-        toggle();
     }
 
     // ---------------------------------------------------------------- rejoin + recheck
@@ -489,12 +574,14 @@ public class SpawnerProtect extends Module {
         // Already back in the world -> start checking.
         if (mc.player != null && mc.world != null) {
             if (state == State.REJOINING) {
-                info("Rejoined, checking for leftover spawners...");
+                info("Rejoined, checking for leftover spawners and shulker boxes...");
                 waitTicks = 0;
                 ticksActive = 0;
                 skipped.clear();
+                attempts.clear();
                 retriedSkipped = false;
-                forceRejoin = false;
+                panicking = false;
+                verifyPasses = 0;
                 state = State.RECHECK;
             }
             return;
@@ -531,34 +618,36 @@ public class SpawnerProtect extends Module {
     private void recheck() {
         if (++waitTicks < 100) return; // let chunks and entities load
 
-        if (!findBlocks(spawnerRange.get(), true).isEmpty()) {
-            if (!nextRound("A spawner is still placed")) return;
+        if (hasUnskippedTarget()) {
+            if (!nextRound("A spawner or shulker box is still placed")) return;
             state = State.MINING;
             return;
         }
 
-        if (nearestSpawnerDrop(spawnerRange.get() + 8) != null) {
-            if (!nextRound("A spawner is still on the ground")) return;
+        if (nearestDrop(spawnerRange.get() + 8) != null) {
+            if (!nextRound("A spawner or shulker box is still on the ground")) return;
             waitTicks = 0;
             state = State.COLLECTING;
             return;
         }
 
-        if (countSpawners() > 0) {
-            if (!nextRound("Spawners are still in your inventory")) return;
-            noProgressTicks = 0;
-            state = State.DEPOSIT;
+        depMode = Dep.ALL;
+        if (countDeposit() > 0) {
+            if (!nextRound("Spawners or shulker boxes are still in your inventory")) return;
+            startDeposit();
             return;
         }
 
-        info("Recheck passed: no spawners left. All done.");
+        info("Recheck passed: no spawners or shulker boxes left. Turning off and leaving.");
+        disconnect("[SpawnerProtect] All clear - nothing left.");
         toggle();
     }
 
     private boolean nextRound(String why) {
         rounds++;
         if (rounds > maxRounds.get()) {
-            warning(why + ", but the max number of rounds was reached. Stopping.");
+            warning(why + ", but the max number of rounds was reached. Leaving for good.");
+            disconnect("[SpawnerProtect] Gave up after " + maxRounds.get() + " rounds.");
             toggle();
             return false;
         }
@@ -602,16 +691,26 @@ public class SpawnerProtect extends Module {
             if (!boxOpenSeen) {
                 boxOpenSeen = true;
                 actionTimer = 5;
+                lastCount = countSpawners();
+                noProgressTicks = 0;
                 say("Shulker box open - loading spawners.");
             }
             if (actionTimer-- > 0) return;
             actionTimer = depositDelay.get();
 
+            int now = countSpawners();
+            if (now != lastCount) {
+                lastCount = now;
+                noProgressTicks = 0;
+            } else if (++noProgressTicks > 40) {
+                shulkerFail("The shulker box won't take the spawners (full?)");
+                return;
+            }
+
             // Slots 0-26 are the shulker, the rest is your inventory.
             for (int i = 27; i < handler.slots.size(); i++) {
                 if (handler.getSlot(i).getStack().isOf(Items.SPAWNER)) {
                     InvUtils.shiftClick().slotId(i);
-                    noProgressTicks = 0;
                     return;
                 }
             }
@@ -707,11 +806,8 @@ public class SpawnerProtect extends Module {
         if (++waitTicks < 15) return;
 
         if (countLoadedShulkers() > 0) {
-            noProgressTicks = 0;
-            openCooldown = 0;
-            chestLookTicks = 0;
-            depositingShulkers = true;
-            state = State.DEPOSIT;
+            depMode = Dep.LOADED_SHULKERS;
+            startDeposit();
         } else {
             shulkerFail("Couldn't find the loaded shulker box after breaking it");
         }
@@ -726,17 +822,40 @@ public class SpawnerProtect extends Module {
         }
     }
 
-    private boolean hasUnskippedSpawner() {
-        for (BlockPos p : findBlocks(spawnerRange.get(), true)) if (!skipped.contains(p)) return true;
-        return false;
+    private List<BlockPos> unskipped(List<BlockPos> list) {
+        List<BlockPos> out = new ArrayList<>();
+        for (BlockPos p : list) if (!skipped.contains(p)) out.add(p);
+        return out;
     }
 
-    private ItemEntity nearestSpawnerDrop(double radius) {
+    private boolean hasUnskippedTarget() {
+        if (!unskipped(findBlocks(spawnerRange.get(), true)).isEmpty()) return true;
+        return shulkerLoad.get() && !unskipped(findShulkerBlocks(spawnerRange.get())).isEmpty();
+    }
+
+    /** Anything we want to pick up: spawners, and with shulker-load also shulker boxes. */
+    private boolean isCollectible(ItemStack s) {
+        return s.isOf(Items.SPAWNER) || (shulkerLoad.get() && isShulker(s));
+    }
+
+    private ItemEntity nearestDrop(double radius) {
         ItemEntity nearest = null;
         double best = Double.MAX_VALUE;
         for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
                 mc.player.getBoundingBox().expand(radius),
-                i -> i.getStack().isOf(Items.SPAWNER))) {
+                i -> isCollectible(i.getStack()))) {
+            double d = mc.player.squaredDistanceTo(e);
+            if (d < best) { best = d; nearest = e; }
+        }
+        return nearest;
+    }
+
+    private ItemEntity nearestShulkerDrop(double radius) {
+        ItemEntity nearest = null;
+        double best = Double.MAX_VALUE;
+        for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
+                mc.player.getBoundingBox().expand(radius),
+                i -> isLoadedShulker(i.getStack()))) {
             double d = mc.player.squaredDistanceTo(e);
             if (d < best) { best = d; nearest = e; }
         }
@@ -757,6 +876,24 @@ public class SpawnerProtect extends Module {
         return list;
     }
 
+    private List<BlockPos> findShulkerBlocks(int range) {
+        List<BlockPos> list = new ArrayList<>();
+        BlockPos c = mc.player.getBlockPos();
+        for (int x = -range; x <= range; x++)
+            for (int y = -range; y <= range; y++)
+                for (int z = -range; z <= range; z++) {
+                    BlockPos p = c.add(x, y, z);
+                    if (mc.world.getBlockState(p).getBlock() instanceof ShulkerBoxBlock) list.add(p);
+                }
+        list.sort(Comparator.comparingDouble(p -> mc.player.squaredDistanceTo(Vec3d.ofCenter(p))));
+        return list;
+    }
+
+    private BlockPos nearestShulker(int range) {
+        List<BlockPos> list = findShulkerBlocks(range);
+        return list.isEmpty() ? null : list.get(0);
+    }
+
     private boolean inventoryFull() {
         for (int i = 0; i < 36; i++) {
             if (mc.player.getInventory().getStack(i).isEmpty()) return false;
@@ -768,10 +905,11 @@ public class SpawnerProtect extends Module {
         return s.getItem() instanceof BlockItem bi && bi.getBlock() instanceof ShulkerBoxBlock;
     }
 
+    /** A shulker box item with anything inside it. */
     private boolean isLoadedShulker(ItemStack s) {
         if (!isShulker(s)) return false;
         ContainerComponent c = s.get(DataComponentTypes.CONTAINER);
-        return c != null && c.streamNonEmpty().anyMatch(x -> x.isOf(Items.SPAWNER));
+        return c != null && c.streamNonEmpty().findAny().isPresent();
     }
 
     private int countLoadedShulkers() {
@@ -783,38 +921,17 @@ public class SpawnerProtect extends Module {
     }
 
     private boolean shouldDeposit(ItemStack s) {
-        return depositingShulkers ? isLoadedShulker(s) : s.isOf(Items.SPAWNER);
+        if (depMode == Dep.LOADED_SHULKERS) return isLoadedShulker(s);
+        return s.isOf(Items.SPAWNER) || (shulkerLoad.get() && isShulker(s));
     }
 
     private int countDeposit() {
-        return depositingShulkers ? countLoadedShulkers() : countSpawners();
-    }
-
-    private BlockPos nearestShulker(int range) {
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
-        BlockPos c = mc.player.getBlockPos();
-        for (int x = -range; x <= range; x++)
-            for (int y = -range; y <= range; y++)
-                for (int z = -range; z <= range; z++) {
-                    BlockPos p = c.add(x, y, z);
-                    if (!(mc.world.getBlockState(p).getBlock() instanceof ShulkerBoxBlock)) continue;
-                    double d = mc.player.squaredDistanceTo(Vec3d.ofCenter(p));
-                    if (d < bestDist) { bestDist = d; best = p; }
-                }
-        return best;
-    }
-
-    private ItemEntity nearestShulkerDrop(double radius) {
-        ItemEntity nearest = null;
-        double best = Double.MAX_VALUE;
-        for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
-                mc.player.getBoundingBox().expand(radius),
-                i -> isLoadedShulker(i.getStack()))) {
-            double d = mc.player.squaredDistanceTo(e);
-            if (d < best) { best = d; nearest = e; }
+        int n = 0;
+        for (int i = 0; i < mc.player.getInventory().size(); i++) {
+            ItemStack s = mc.player.getInventory().getStack(i);
+            if (shouldDeposit(s)) n += s.getCount();
         }
-        return nearest;
+        return n;
     }
 
     private int countSpawners() {
