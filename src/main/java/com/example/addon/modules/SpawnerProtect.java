@@ -57,8 +57,9 @@ import java.util.Set;
  * picked up in the ender chest and leaves immediately.
  */
 public class SpawnerProtect extends Module {
-    private static final int MAX_VERIFY_PASSES = 3;
+    private static final int MAX_VERIFY_PASSES = 5;
     private static final int MAX_ATTEMPTS = 2;
+    private static final int MAX_PACK_ROUNDS = 6;
 
     private final SettingGroup sg = settings.getDefaultGroup();
 
@@ -125,6 +126,7 @@ public class SpawnerProtect extends Module {
     private int ticksActive, waitTicks, actionTimer, noProgressTicks, verifyPasses, lastCount;
     private int lookTicks, mineTicks, openCooldown, chestLookTicks, shulkerTicks, shulkersStored;
     private int rejoinTimer, connectTicks, connectAttempts, rounds;
+    private int packRounds, shulkerItemsBefore, collectTargetId = -1, collectTicks;
 
     private String reason = "";
     private String lastMsg = "";
@@ -134,6 +136,8 @@ public class SpawnerProtect extends Module {
     private final Set<BlockPos> skipped = new HashSet<>();
     private final Map<BlockPos, Integer> attempts = new HashMap<>();
     private boolean retriedSkipped, chestOpenSeen, boxOpenSeen, shulkerDisabled, noRejoin, panicking;
+    private boolean shulkersUnlocked, midRunDeposit;
+    private final Set<Integer> ignoredDrops = new HashSet<>();
 
     public SpawnerProtect() {
         super(AddonTemplate.CATEGORY, "spawner-protect",
@@ -160,6 +164,10 @@ public class SpawnerProtect extends Module {
         skipped.clear();
         attempts.clear();
         retriedSkipped = chestOpenSeen = boxOpenSeen = shulkerDisabled = noRejoin = panicking = false;
+        shulkersUnlocked = midRunDeposit = false;
+        packRounds = shulkerItemsBefore = collectTicks = 0;
+        collectTargetId = -1;
+        ignoredDrops.clear();
     }
 
     @EventHandler
@@ -241,7 +249,8 @@ public class SpawnerProtect extends Module {
         if (maybeStartShulker(State.MINING)) return;
 
         List<BlockPos> spawnersAll = findBlocks(spawnerRange.get(), true);
-        List<BlockPos> shulkersAll = shulkerLoad.get() ? findShulkerBlocks(spawnerRange.get()) : new ArrayList<>();
+        List<BlockPos> shulkersAll = (shulkerLoad.get() && shulkersUnlocked)
+            ? findShulkerBlocks(spawnerRange.get()) : new ArrayList<>();
 
         // Spawners first, then (with shulker-load) every placed shulker box.
         List<BlockPos> targets = unskipped(spawnersAll);
@@ -344,16 +353,30 @@ public class SpawnerProtect extends Module {
     // ---------------------------------------------------------------- collecting
 
     private void collect() {
-        ItemEntity nearest = nearestDrop(spawnerRange.get() + 4);
+        ItemEntity nearest = nearestDrop(spawnerRange.get() + 8);
         if (nearest != null) {
             if (maybeStartShulker(State.COLLECTING)) return;
+
+            // Don't chase one item forever (e.g. it fell somewhere unreachable).
+            if (nearest.getId() != collectTargetId) {
+                collectTargetId = nearest.getId();
+                collectTicks = 0;
+            }
+            if (++collectTicks > 200) {
+                ignoredDrops.add(nearest.getId());
+                collectTargetId = -1;
+                warning("Couldn't pick up an item at " + (int) nearest.getX() + " " + (int) nearest.getY()
+                    + " " + (int) nearest.getZ() + " (unreachable or inventory full?) - ignoring it.");
+                return;
+            }
+
             waitTicks = 0;
             walkTo(new Vec3d(nearest.getX(), nearest.getY(), nearest.getZ()));
             return;
         }
 
-        // Drops can take a moment to appear / get picked up.
-        if (++waitTicks < 15) return;
+        // Nothing on the ground right now. Wait a moment: drops can take a second to appear.
+        if (++waitTicks < 30) return;
 
         if (verifyPasses < MAX_VERIFY_PASSES) {
             waitTicks = 0;
@@ -375,7 +398,7 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        if (nearestDrop(spawnerRange.get() + 8) != null) {
+        if (nearestDrop(spawnerRange.get() + 12) != null) {
             verifyPasses++;
             warning("Double check: something is still on the ground, collecting it (" + verifyPasses + "/" + MAX_VERIFY_PASSES + ").");
             waitTicks = 0;
@@ -388,6 +411,25 @@ public class SpawnerProtect extends Module {
     }
 
     private void finishPickup() {
+        // Shulker mode: before storing anything, pack the spawners we carry into a shulker box
+        // (a nearby placed one, or one from the hotbar), then break every shulker box.
+        // If a shulker box fills up, the leftover spawners just go into the ender chest with it.
+        if (shulkerLoad.get() && !shulkerDisabled) {
+            shulkersUnlocked = true;
+
+            if (countSpawners() > 0 && packRounds < MAX_PACK_ROUNDS && shulkerAvailable()) {
+                packRounds++;
+                beginShulkerCycle(State.MINING, "Packing the spawners you're carrying into a shulker box.");
+                return;
+            }
+
+            if (!unskipped(findShulkerBlocks(spawnerRange.get())).isEmpty()) {
+                verifyPasses = 0;
+                state = State.MINING; // mine() breaks the shulker boxes
+                return;
+            }
+        }
+
         depMode = Dep.ALL;
         if (countDeposit() > 0) {
             startDeposit();
@@ -403,6 +445,7 @@ public class SpawnerProtect extends Module {
     // ---------------------------------------------------------------- ender chest
 
     private void startDeposit() {
+        midRunDeposit = false;
         noProgressTicks = 0;
         openCooldown = 0;
         chestLookTicks = 0;
@@ -413,7 +456,8 @@ public class SpawnerProtect extends Module {
     private void deposit() {
         if (countDeposit() == 0) {
             if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler) mc.player.closeHandledScreen();
-            if (depMode == Dep.LOADED_SHULKERS) {
+            if (midRunDeposit) {
+                midRunDeposit = false;
                 depMode = Dep.ALL;
                 shulkersStored++;
                 info("Loaded shulker box stored in the ender chest - carrying on.");
@@ -556,16 +600,24 @@ public class SpawnerProtect extends Module {
         }
 
         if (!noRejoin) warning("Rejoining only works on multiplayer servers - leaving for good.");
-        disconnect(msg);
-        toggle();
+        finish(msg);
     }
 
     private void disconnect(String msg) {
-        if (mc.getNetworkHandler() != null) {
-            mc.getNetworkHandler().getConnection().disconnect(Text.literal(msg));
-        } else {
-            info(msg);
-        }
+        try {
+            if (mc.getNetworkHandler() != null) {
+                mc.getNetworkHandler().getConnection().disconnect(Text.literal(msg));
+            } else {
+                info(msg);
+            }
+        } catch (Exception ignored) { }
+    }
+
+    /** Leave the game and turn the module off for good. */
+    private void finish(String msg) {
+        info("Spawner Protect finished - turning itself off.");
+        disconnect(msg);
+        if (isActive()) toggle();
     }
 
     // ---------------------------------------------------------------- rejoin + recheck
@@ -579,7 +631,10 @@ public class SpawnerProtect extends Module {
                 ticksActive = 0;
                 skipped.clear();
                 attempts.clear();
+                ignoredDrops.clear();
                 retriedSkipped = false;
+                shulkersUnlocked = true;
+                packRounds = 0;
                 panicking = false;
                 verifyPasses = 0;
                 state = State.RECHECK;
@@ -598,7 +653,7 @@ public class SpawnerProtect extends Module {
         if (++connectTicks > 600) {
             if (connectAttempts >= 10) {
                 warning("Couldn't rejoin after 10 tries, giving up.");
-                toggle();
+                if (isActive()) toggle();
                 return;
             }
             connect();
@@ -624,7 +679,7 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        if (nearestDrop(spawnerRange.get() + 8) != null) {
+        if (nearestDrop(spawnerRange.get() + 12) != null) {
             if (!nextRound("A spawner or shulker box is still on the ground")) return;
             waitTicks = 0;
             state = State.COLLECTING;
@@ -638,17 +693,15 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        info("Recheck passed: no spawners or shulker boxes left. Turning off and leaving.");
-        disconnect("[SpawnerProtect] All clear - nothing left.");
-        toggle();
+        info("Recheck passed: no spawners or shulker boxes left.");
+        finish("[SpawnerProtect] All clear - nothing left.");
     }
 
     private boolean nextRound(String why) {
         rounds++;
         if (rounds > maxRounds.get()) {
             warning(why + ", but the max number of rounds was reached. Leaving for good.");
-            disconnect("[SpawnerProtect] Gave up after " + maxRounds.get() + " rounds.");
-            toggle();
+            finish("[SpawnerProtect] Gave up after " + maxRounds.get() + " rounds.");
             return false;
         }
         warning(why + " - going again (round " + rounds + "/" + maxRounds.get() + ").");
@@ -662,18 +715,28 @@ public class SpawnerProtect extends Module {
     private boolean maybeStartShulker(State resume) {
         if (!shulkerLoad.get() || shulkerDisabled) return false;
         if (countSpawners() == 0 || !inventoryFull()) return false;
+        beginShulkerCycle(resume, "Inventory full - loading the spawners into a shulker box.");
+        return true;
+    }
 
+    private void beginShulkerCycle(State resume, String message) {
         resumeState = resume;
         noProgressTicks = 0;
         openCooldown = 0;
         chestLookTicks = 0;
         lookTicks = 0;
         shulkerTicks = 0;
+        collectTicks = 0;
         boxOpenSeen = false;
         shulkerPos = null;
-        info("Inventory full - loading the spawners into a shulker box.");
+        info(message);
         state = State.SHULKER_LOAD;
-        return true;
+    }
+
+    /** A placed shulker box nearby, or an empty one in the hotbar to place. */
+    private boolean shulkerAvailable() {
+        if (!findShulkerBlocks(6).isEmpty()) return true;
+        return InvUtils.findInHotbar(s -> isShulker(s) && !isLoadedShulker(s)).found();
     }
 
     private void shulkerFail(String why) {
@@ -703,7 +766,9 @@ public class SpawnerProtect extends Module {
                 lastCount = now;
                 noProgressTicks = 0;
             } else if (++noProgressTicks > 40) {
-                shulkerFail("The shulker box won't take the spawners (full?)");
+                // Not taking any more: it's full. Store it as it is; leftovers go in the ender chest.
+                say("Shulker box is full - it will be stored with the rest.");
+                finishLoading();
                 return;
             }
 
@@ -716,11 +781,7 @@ public class SpawnerProtect extends Module {
             }
 
             // Nothing left to move in.
-            mc.player.closeHandledScreen();
-            boxOpenSeen = false;
-            shulkerTicks = 0;
-            lookTicks = 0;
-            state = State.SHULKER_BREAK;
+            finishLoading();
             return;
         }
         boxOpenSeen = false;
@@ -765,6 +826,16 @@ public class SpawnerProtect extends Module {
         mc.player.swingHand(Hand.MAIN_HAND);
     }
 
+    private void finishLoading() {
+        mc.player.closeHandledScreen();
+        boxOpenSeen = false;
+        shulkerTicks = 0;
+        lookTicks = 0;
+        collectTicks = 0;
+        shulkerItemsBefore = countShulkerItems();
+        state = State.SHULKER_BREAK;
+    }
+
     /** Break the loaded shulker box so it drops as an item. */
     private void shulkerBreakStep() {
         if (shulkerPos == null || !(mc.world.getBlockState(shulkerPos).getBlock() instanceof ShulkerBoxBlock)) {
@@ -794,23 +865,33 @@ public class SpawnerProtect extends Module {
         BlockUtils.breakBlock(shulkerPos, true);
     }
 
-    /** Pick the broken shulker box back up, then store it in the ender chest. */
+    /** Pick the broken shulker box back up (and confirm it), then store it in the ender chest. */
     private void shulkerCollectStep() {
-        ItemEntity drop = nearestShulkerDrop(8);
+        // Confirmed: the shulker box item is in the inventory.
+        if (countShulkerItems() > shulkerItemsBefore) {
+            Dep mode = countLoadedShulkers() > 0 ? Dep.LOADED_SHULKERS : Dep.ALL;
+            depMode = mode;
+            startDeposit();
+            midRunDeposit = true;
+            return;
+        }
+
+        ItemEntity drop = nearestShulkerDrop(10);
         if (drop != null) {
             waitTicks = 0;
+            if (++collectTicks > 300) {
+                shulkerFail("Couldn't pick up the broken shulker box");
+                return;
+            }
             walkTo(new Vec3d(drop.getX(), drop.getY(), drop.getZ()));
             return;
         }
 
-        if (++waitTicks < 15) return;
+        // The drop can take a couple of seconds to appear on a laggy server.
+        if (++waitTicks < 60) return;
 
-        if (countLoadedShulkers() > 0) {
-            depMode = Dep.LOADED_SHULKERS;
-            startDeposit();
-        } else {
-            shulkerFail("Couldn't find the loaded shulker box after breaking it");
-        }
+        // The normal collect step will still hunt it down later.
+        shulkerFail("The broken shulker box never showed up");
     }
 
     // ---------------------------------------------------------------- helpers
@@ -830,7 +911,7 @@ public class SpawnerProtect extends Module {
 
     private boolean hasUnskippedTarget() {
         if (!unskipped(findBlocks(spawnerRange.get(), true)).isEmpty()) return true;
-        return shulkerLoad.get() && !unskipped(findShulkerBlocks(spawnerRange.get())).isEmpty();
+        return shulkerLoad.get() && shulkersUnlocked && !unskipped(findShulkerBlocks(spawnerRange.get())).isEmpty();
     }
 
     /** Anything we want to pick up: spawners, and with shulker-load also shulker boxes. */
@@ -843,7 +924,7 @@ public class SpawnerProtect extends Module {
         double best = Double.MAX_VALUE;
         for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
                 mc.player.getBoundingBox().expand(radius),
-                i -> isCollectible(i.getStack()))) {
+                i -> isCollectible(i.getStack()) && !ignoredDrops.contains(i.getId()))) {
             double d = mc.player.squaredDistanceTo(e);
             if (d < best) { best = d; nearest = e; }
         }
@@ -855,7 +936,7 @@ public class SpawnerProtect extends Module {
         double best = Double.MAX_VALUE;
         for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
                 mc.player.getBoundingBox().expand(radius),
-                i -> isLoadedShulker(i.getStack()))) {
+                i -> isShulker(i.getStack()))) {
             double d = mc.player.squaredDistanceTo(e);
             if (d < best) { best = d; nearest = e; }
         }
@@ -910,6 +991,15 @@ public class SpawnerProtect extends Module {
         if (!isShulker(s)) return false;
         ContainerComponent c = s.get(DataComponentTypes.CONTAINER);
         return c != null && c.streamNonEmpty().findAny().isPresent();
+    }
+
+    private int countShulkerItems() {
+        int n = 0;
+        for (int i = 0; i < mc.player.getInventory().size(); i++) {
+            ItemStack st = mc.player.getInventory().getStack(i);
+            if (isShulker(st)) n += st.getCount();
+        }
+        return n;
     }
 
     private int countLoadedShulkers() {
