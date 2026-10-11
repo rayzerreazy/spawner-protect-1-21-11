@@ -16,6 +16,7 @@ import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
+import net.minecraft.client.sound.PositionedSoundInstance;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.enchantment.Enchantment;
@@ -29,6 +30,8 @@ import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.ShulkerBoxScreenHandler;
+import net.minecraft.sound.SoundEvent;
+import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
@@ -100,6 +103,14 @@ public class SpawnerProtect extends Module {
         .name("rotate").description("Silent rotation when placing the ender chest or a shulker box.")
         .defaultValue(true).build());
 
+    private final Setting<Boolean> sounds = sg.add(new BoolSetting.Builder()
+        .name("sounds").description("Play sound effects for key moments (player detected, panic, spawner mined, stored, rejoined, finished).")
+        .defaultValue(true).build());
+
+    private final Setting<Integer> soundVolume = sg.add(new IntSetting.Builder()
+        .name("sound-volume").description("Volume of the sound effects, in percent.")
+        .defaultValue(60).min(0).max(100).sliderMax(100).visible(sounds::get).build());
+
     private final Setting<Integer> timeout = sg.add(new IntSetting.Builder()
         .name("timeout-seconds").description("Safety: store everything and leave after this long even if not finished. 0 = off.")
         .defaultValue(180).min(0).sliderMax(600).build());
@@ -138,6 +149,8 @@ public class SpawnerProtect extends Module {
     private final Map<BlockPos, Integer> attempts = new HashMap<>();
     private final Map<BlockPos, Integer> skippedAt = new HashMap<>();
     private int handled; // blocks mined or given up on so far
+    private BlockPos pendingBreak; // a block that vanished; waiting to see if the server really broke it
+    private int pendingTicks;
     private boolean retriedSkipped, chestOpenSeen, boxOpenSeen, shulkerDisabled, noRejoin, panicking;
     private boolean shulkersUnlocked, midRunDeposit;
     private final Set<Integer> ignoredDrops = new HashSet<>();
@@ -168,6 +181,8 @@ public class SpawnerProtect extends Module {
         attempts.clear();
         skippedAt.clear();
         handled = 0;
+        pendingBreak = null;
+        pendingTicks = 0;
         retriedSkipped = chestOpenSeen = boxOpenSeen = shulkerDisabled = noRejoin = panicking = false;
         shulkersUnlocked = midRunDeposit = false;
         packRounds = shulkerItemsBefore = collectTicks = 0;
@@ -200,6 +215,7 @@ public class SpawnerProtect extends Module {
             PlayerEntity close = findIntruder(panicRange.get());
             if (close != null) {
                 reason = close.getName().getString();
+                beep(SoundEvents.ENTITY_ENDER_DRAGON_GROWL, 1.0f);
                 storeAndLeave("Player " + reason + " is within " + panicRange.get()
                     + " blocks - storing everything and leaving!", true);
             }
@@ -211,6 +227,7 @@ public class SpawnerProtect extends Module {
                 if (p != null) {
                     reason = p.getName().getString();
                     info("Player detected: " + reason + " - securing spawners.");
+                    beep(SoundEvents.BLOCK_BELL_USE, 0.8f);
                     state = State.MINING;
                 }
             }
@@ -253,10 +270,23 @@ public class SpawnerProtect extends Module {
     private void mine() {
         if (maybeStartShulker(State.MINING)) return;
 
-        // Did the block we were working on break?
-        if (mineTarget != null && !isMineable(mineTarget)) {
-            handled++;
-            attempts.remove(mineTarget);
+        // A block that vanished may just be the client guessing: the server can put it back
+        // (anti-cheat, timing, tool mismatch). Only count it as mined once it has stayed gone.
+        if (pendingBreak != null) {
+            if (isMineable(pendingBreak)) {
+                BlockPos back = pendingBreak;
+                pendingBreak = null;
+                failAttempt(back, "The server put the block back (it was not really broken).");
+            } else if (++pendingTicks >= 12) {
+                handled++;
+                beep(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.3f);
+                attempts.remove(pendingBreak);
+                pendingBreak = null;
+            }
+        }
+        if (pendingBreak == null && mineTarget != null && !isMineable(mineTarget)) {
+            pendingBreak = mineTarget;
+            pendingTicks = 0;
             mineTarget = null;
         }
 
@@ -332,31 +362,53 @@ public class SpawnerProtect extends Module {
             lookTarget = target;
             lookTicks = 0;
         }
-        lookAt(target);
-        // Wait until the crosshair is on the block. If something is in the way
-        // and it never lines up, stop waiting after 2 seconds and mine anyway.
-        if (!isLookingAt(target) && ++lookTicks < 40) return;
+        // Turn to the block only if we aren't already aimed at it, then hold the aim steady.
+        // If something is in the way and it never lines up, stop waiting after 2 seconds.
+        if (!isLookingAt(target)) {
+            lookAt(target);
+            if (!isLookingAt(target) && ++lookTicks < 40) return;
+        }
 
         // One attempt = attempt-seconds of trying. After 2 failed attempts, skip the block.
         if (++mineTicks > attemptSeconds.get() * 20) {
-            int n = attempts.merge(target, 1, Integer::sum);
-            mineTicks = 0;
-            lookTicks = 0;
-            String where = target.getX() + " " + target.getY() + " " + target.getZ();
-            if (n >= MAX_ATTEMPTS) {
-                skipped.add(target);
-                handled++;
-                skippedAt.put(target, handled);
-                mineTarget = null;
-                warning("Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - skipping it until 2 other blocks are done.");
-            } else {
-                warning("Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - trying again.");
-            }
+            failAttempt(target, "Not broken in time.");
             return;
         }
 
         if (forShulker) say("Breaking a shulker box.");
-        BlockUtils.breakBlock(target, true);
+        breakBlockLegit(target);
+    }
+
+    /** One failed attempt on a block; after MAX_ATTEMPTS it gets skipped for now. */
+    private void failAttempt(BlockPos target, String why) {
+        int n = attempts.merge(target, 1, Integer::sum);
+        mineTicks = 0;
+        lookTicks = 0;
+        String where = target.getX() + " " + target.getY() + " " + target.getZ();
+        if (n >= MAX_ATTEMPTS) {
+            skipped.add(target);
+            beep(SoundEvents.ENTITY_VILLAGER_NO, 1.0f);
+            handled++;
+            skippedAt.put(target, handled);
+            if (target.equals(mineTarget)) mineTarget = null;
+            warning(why + " Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - skipping it until 2 other blocks are done.");
+        } else {
+            warning(why + " Attempt " + n + "/" + MAX_ATTEMPTS + " failed at " + where + " - trying again.");
+        }
+    }
+
+    /** Break a block the way the vanilla client does: using the face we are really looking at. */
+    private void breakBlockLegit(BlockPos pos) {
+        Direction side = Direction.UP;
+        HitResult hit = mc.player.raycast(4.5, 1f, false);
+        if (hit instanceof BlockHitResult bhr && bhr.getBlockPos().equals(pos)) side = bhr.getSide();
+
+        if (mc.interactionManager.isBreakingBlock()) {
+            mc.interactionManager.updateBlockBreakingProgress(pos, side);
+        } else {
+            mc.interactionManager.attackBlock(pos, side);
+        }
+        mc.player.swingHand(Hand.MAIN_HAND);
     }
 
     private void lookAt(BlockPos pos) {
@@ -492,6 +544,7 @@ public class SpawnerProtect extends Module {
                 return;
             }
             info("Everything stored in the ender chest.");
+            beep(SoundEvents.ENTITY_PLAYER_LEVELUP, 1.0f);
             state = State.LEAVE;
             return;
         }
@@ -642,6 +695,7 @@ public class SpawnerProtect extends Module {
     /** Leave the game and turn the module off for good. */
     private void finish(String msg) {
         info("Spawner Protect finished - turning itself off.");
+        beep(SoundEvents.UI_TOAST_CHALLENGE_COMPLETE, 1.0f);
         disconnect(msg);
         if (isActive()) toggle();
     }
@@ -653,6 +707,7 @@ public class SpawnerProtect extends Module {
         if (mc.player != null && mc.world != null) {
             if (state == State.REJOINING) {
                 info("Rejoined, checking for leftover spawners and shulker boxes...");
+                beep(SoundEvents.ENTITY_ENDERMAN_TELEPORT, 1.0f);
                 waitTicks = 0;
                 ticksActive = 0;
                 skipped.clear();
@@ -890,7 +945,7 @@ public class SpawnerProtect extends Module {
         if (!isLookingAt(shulkerPos) && ++lookTicks < 40) return;
 
         say("Breaking the loaded shulker box.");
-        BlockUtils.breakBlock(shulkerPos, true);
+        breakBlockLegit(shulkerPos);
     }
 
     /** Pick the broken shulker box back up (and confirm it), then store it in the ender chest. */
@@ -923,6 +978,13 @@ public class SpawnerProtect extends Module {
     }
 
     // ---------------------------------------------------------------- helpers
+
+    private void beep(SoundEvent sound, float pitch) {
+        if (!sounds.get() || soundVolume.get() == 0) return;
+        try {
+            mc.getSoundManager().play(PositionedSoundInstance.master(sound, pitch, soundVolume.get() / 100f));
+        } catch (Exception ignored) { }
+    }
 
     private boolean isMineable(BlockPos pos) {
         var b = mc.world.getBlockState(pos).getBlock();
