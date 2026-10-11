@@ -48,6 +48,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 
 /**
@@ -90,6 +91,10 @@ public class SpawnerProtect extends Module {
     private final Setting<Boolean> shulkerLoad = sg.add(new BoolSetting.Builder()
         .name("shulker-load").description("Break every placed shulker box too, and when your inventory is full put the spawners in a shulker box and store it in the ender chest.")
         .defaultValue(false).build());
+
+    private final Setting<Integer> holdClickChance = sg.add(new IntSetting.Builder()
+        .name("hold-click-chance").description("Percent of blocks mined by holding the attack key like a player holding left-click. The rest use the per-tick break method. 100 = always hold, 0 = never.")
+        .defaultValue(75).min(0).max(100).sliderMax(100).build());
 
     private final Setting<Integer> attemptSeconds = sg.add(new IntSetting.Builder()
         .name("attempt-seconds").description("How long one attempt to break a block gets. After 2 failed attempts (anti-cheat) the block is skipped.")
@@ -151,6 +156,8 @@ public class SpawnerProtect extends Module {
     private int handled; // blocks mined or given up on so far
     private BlockPos pendingBreak; // a block that vanished; waiting to see if the server really broke it
     private int pendingTicks;
+    private final Random rng = new Random();
+    private boolean holdMode;
     private boolean retriedSkipped, chestOpenSeen, boxOpenSeen, shulkerDisabled, noRejoin, panicking;
     private boolean shulkersUnlocked, midRunDeposit;
     private final Set<Integer> ignoredDrops = new HashSet<>();
@@ -335,7 +342,10 @@ public class SpawnerProtect extends Module {
         final boolean forShulker = shulkerTarget;
         FindItemResult pick = InvUtils.findInHotbar(s -> s.isIn(ItemTags.PICKAXES) && (forShulker || hasSilkTouch(s)));
         if (pick.found()) {
-            InvUtils.swap(pick.slot(), false);
+            // Only switch slots if we aren't already holding it (switching mid-break resets progress).
+            if (mc.player.getMainHandStack() != mc.player.getInventory().getStack(pick.slot())) {
+                InvUtils.swap(pick.slot(), false);
+            }
         } else if (!forShulker) {
             error("No silk touch pickaxe in hotbar!");
             noRejoin = true;
@@ -356,6 +366,9 @@ public class SpawnerProtect extends Module {
         if (!target.equals(mineTarget)) {
             mineTarget = target;
             mineTicks = 0;
+            holdMode = rng.nextInt(100) < holdClickChance.get();
+            info("Mining " + (forShulker ? "the shulker box" : "the spawner") + " at " + target.getX() + " "
+                + target.getY() + " " + target.getZ() + (holdMode ? " (holding the attack key)." : " (break packets)."));
         }
 
         if (!target.equals(lookTarget)) {
@@ -375,8 +388,12 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        if (forShulker) say("Breaking a shulker box.");
-        breakBlockLegit(target);
+        if (holdMode && isLookingAt(target)) {
+            // Hold left-click: the game's own mining code does the rest, only while we're really aimed at it.
+            mc.options.attackKey.setPressed(true);
+        } else {
+            breakBlockLegit(target);
+        }
     }
 
     /** One failed attempt on a block; after MAX_ATTEMPTS it gets skipped for now. */
@@ -1147,6 +1164,8 @@ public class SpawnerProtect extends Module {
             mc.options.forwardKey.setPressed(false);
             mc.options.jumpKey.setPressed(false);
             mc.options.sneakKey.setPressed(false);
+            mc.options.attackKey.setPressed(false);
         }
     }
 }
+
