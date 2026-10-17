@@ -10,7 +10,11 @@ import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.LoreComponent;
 import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.registry.Registries;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
@@ -66,6 +70,10 @@ public class BoneSell extends Module {
     private final Setting<String> confirmText = sgButtons.add(new StringSetting.Builder()
         .name("confirm-button-text").description("Then click the item whose name contains this text. Leave empty if there is no confirm step.")
         .defaultValue("confirm").build());
+
+    private final Setting<Boolean> greenPaneFallback = sgButtons.add(new BoolSetting.Builder()
+        .name("green-pane-fallback").description("If no confirm button is found by its name or description, click the green glass pane in the menu.")
+        .defaultValue(true).build());
 
     private final Setting<String> neverText = sgButtons.add(new StringSetting.Builder()
         .name("never-click-text").description("Never click an item whose name contains any of these words (separate with commas). Keeps it from dropping the bones.")
@@ -242,9 +250,14 @@ public class BoneSell extends Module {
         }
 
         int slot = findButton(text);
+        // The confirm button may have a blank or unusual name: after a few tries, use the green pane.
+        if (slot < 0 && greenPaneFallback.get() && tries >= 3) slot = findGreenPane();
+
         if (slot < 0) {
-            if (++tries > 20) {
-                step = Step.CLOSING; // no confirm button appeared: nothing more to press
+            if (++tries == 3) logMenu(); // show what's in the menu (if debug-menu is on)
+            if (tries > 20) {
+                warning("Couldn't find the confirm button. Turn on debug-menu to see the item names.");
+                step = Step.CLOSING;
                 return;
             }
             timer = clickDelay.get();
@@ -384,12 +397,32 @@ public class BoneSell extends Module {
             ItemStack stack = slot.getStack();
             if (stack.isEmpty()) continue;
             String name = stack.getName().getString().toLowerCase();
-            if (!name.contains(wanted)) continue;
+            if (!name.contains(wanted) && !loreText(stack).contains(wanted)) continue;
             boolean blocked = false;
             for (String n : never) if (name.contains(n)) { blocked = true; break; }
             if (!blocked) return slot.id;
         }
         return -1;
+    }
+
+    /** The first green / lime glass pane in the menu (not your own inventory). */
+    private int findGreenPane() {
+        ScreenHandler handler = mc.player.currentScreenHandler;
+        for (Slot slot : handler.slots) {
+            if (slot.inventory == mc.player.getInventory()) continue;
+            ItemStack stack = slot.getStack();
+            if (stack.isOf(Items.LIME_STAINED_GLASS_PANE) || stack.isOf(Items.GREEN_STAINED_GLASS_PANE)) return slot.id;
+        }
+        return -1;
+    }
+
+    /** The item's description lines, lower-cased, joined into one string. */
+    private String loreText(ItemStack stack) {
+        LoreComponent lore = stack.get(DataComponentTypes.LORE);
+        if (lore == null) return "";
+        StringBuilder sb = new StringBuilder();
+        for (Text line : lore.lines()) sb.append(line.getString().toLowerCase()).append(' ');
+        return sb.toString();
     }
 
     private List<String> neverWords() {
@@ -414,7 +447,7 @@ public class BoneSell extends Module {
             if (slot.inventory == mc.player.getInventory()) continue;
             ItemStack stack = slot.getStack();
             if (stack.isEmpty()) continue;
-            info("slot " + slot.id + ": " + stack.getName().getString());
+            info("slot " + slot.id + ": \"" + stack.getName().getString() + "\" [" + Registries.ITEM.getId(stack.getItem()).getPath() + "]");
         }
     }
 
