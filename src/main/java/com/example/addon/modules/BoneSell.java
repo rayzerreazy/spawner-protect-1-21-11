@@ -71,6 +71,10 @@ public class BoneSell extends Module {
         .name("confirm-button-text").description("Then click the item whose name contains this text. Leave empty if there is no confirm step.")
         .defaultValue("confirm").build());
 
+    private final Setting<Integer> confirmClicks = sgButtons.add(new IntSetting.Builder()
+        .name("confirm-clicks").description("How many times to click the confirm button. The menu needs 2 (it closes by itself after the second click).")
+        .defaultValue(2).min(1).max(3).sliderMax(3).build());
+
     private final Setting<Boolean> greenPaneFallback = sgButtons.add(new BoolSetting.Builder()
         .name("green-pane-fallback").description("If no confirm button is found by its name or description, click the green glass pane in the menu.")
         .defaultValue(true).build());
@@ -100,6 +104,7 @@ public class BoneSell extends Module {
 
     private int cooldownTicks, timer, openTicks, openCooldown, tries;
     private int failedSells, rejoinStreak;
+    private int confirmClicksDone, confirmSlot = -1, closeWait;
     private int rejoinTimer, connectTicks, connectAttempts;
     private boolean disconnected;
     private ServerInfo lastServer;
@@ -117,6 +122,8 @@ public class BoneSell extends Module {
         soldAt.clear();
         cooldownTicks = timer = openTicks = openCooldown = tries = 0;
         failedSells = rejoinStreak = 0;
+        confirmClicksDone = closeWait = 0;
+        confirmSlot = -1;
         rejoinTimer = connectTicks = connectAttempts = 0;
         disconnected = false;
         lastServer = null;
@@ -232,6 +239,8 @@ public class BoneSell extends Module {
         click(slot);
         say("Pressed sell.");
         tries = 0;
+        confirmClicksDone = 0;
+        confirmSlot = -1;
         timer = clickDelay.get();
         step = Step.CONFIRM;
     }
@@ -246,6 +255,18 @@ public class BoneSell extends Module {
         String text = confirmText.get().trim();
         if (text.isEmpty()) {
             step = Step.CLOSING;
+            return;
+        }
+
+        // 2nd (3rd) click: same button again - the menu needs a double click.
+        if (confirmClicksDone > 0 && confirmSlot >= 0) {
+            click(confirmSlot);
+            confirmClicksDone++;
+            if (confirmClicksDone >= confirmClicks.get()) {
+                say("Pressed confirm (" + confirmClicksDone + " clicks).");
+                step = Step.CLOSING;
+            }
+            timer = clickDelay.get();
             return;
         }
 
@@ -266,12 +287,21 @@ public class BoneSell extends Module {
 
         logMenu();
         click(slot);
-        say("Pressed confirm.");
+        confirmSlot = slot;
+        confirmClicksDone = 1;
+        if (confirmClicks.get() <= 1) {
+            say("Pressed confirm.");
+            step = Step.CLOSING;
+        }
         timer = clickDelay.get();
-        step = Step.CLOSING;
     }
 
     private void closing() {
+        // The menu closes by itself after the confirm clicks; give it a moment before closing it ourselves.
+        if (menuOpen() && closeWait++ < 5) {
+            timer = clickDelay.get();
+            return;
+        }
         closeMenu();
         finishCycle(true);
     }
@@ -284,6 +314,9 @@ public class BoneSell extends Module {
             info("Sold. Look at the next spawner.");
         }
         cooldownTicks = sold ? clickDelay.get() * 2 : 40;
+        closeWait = 0;
+        confirmClicksDone = 0;
+        confirmSlot = -1;
         target = null;
         step = Step.WAITING;
     }
