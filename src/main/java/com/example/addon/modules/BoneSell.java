@@ -4,6 +4,8 @@ import com.example.addon.AddonTemplate;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.gui.screen.TitleScreen;
@@ -23,6 +25,8 @@ import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -44,6 +48,7 @@ public class BoneSell extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgButtons = settings.createGroup("Buttons");
     private final SettingGroup sgRejoin = settings.createGroup("Rejoin");
+    private final SettingGroup sgAuto = settings.createGroup("Auto sell all");
 
     // ---- General
     private final Setting<Integer> cooldownSeconds = sgGeneral.add(new IntSetting.Builder()
@@ -96,6 +101,23 @@ public class BoneSell extends Module {
         .name("max-rejoins-in-a-row").description("Stop the module if this many rejoins happen in a row without a successful sell.")
         .defaultValue(3).min(1).max(10).sliderMax(10).build());
 
+    // ---- Auto sell all
+    private final Setting<Boolean> autoSell = sgAuto.add(new BoolSetting.Builder()
+        .name("auto-sell-all").description("Every so many hours, walk to every spawner near you and sell its bones. The timer starts when the module is turned on.")
+        .defaultValue(false).build());
+
+    private final Setting<Double> autoHours = sgAuto.add(new DoubleSetting.Builder()
+        .name("auto-interval-hours").description("Hours between automatic sells.")
+        .defaultValue(14).min(0.1).max(72).sliderMax(24).decimalPlaces(1).build());
+
+    private final Setting<Integer> autoRadius = sgAuto.add(new IntSetting.Builder()
+        .name("auto-radius").description("Sell the spawners within this many blocks of you.")
+        .defaultValue(10).min(1).max(32).sliderMax(32).build());
+
+    private final Setting<Keybind> autoRunKey = sgAuto.add(new KeybindSetting.Builder()
+        .name("sell-all-now-key").description("Press to run the sell-all right now (handy for testing).")
+        .defaultValue(Keybind.none()).action(this::runAutoNow).build());
+
     private enum Step { WAITING, OPENING, SELL, CONFIRM, CLOSING, REJOIN_WAIT, REJOINING }
 
     private Step step = Step.WAITING;
@@ -104,6 +126,10 @@ public class BoneSell extends Module {
 
     private int cooldownTicks, timer, openTicks, openCooldown, tries;
     private int failedSells, rejoinStreak;
+    private boolean autoRun;
+    private final List<BlockPos> autoQueue = new ArrayList<>();
+    private long nextAutoAt;
+    private int walkTicks, autoLookTicks;
     private int confirmClicksDone, confirmSlot = -1, closeWait;
     private int rejoinTimer, connectTicks, connectAttempts;
     private boolean disconnected;
@@ -122,6 +148,10 @@ public class BoneSell extends Module {
         soldAt.clear();
         cooldownTicks = timer = openTicks = openCooldown = tries = 0;
         failedSells = rejoinStreak = 0;
+        autoRun = false;
+        autoQueue.clear();
+        nextAutoAt = 0;
+        walkTicks = autoLookTicks = 0;
         confirmClicksDone = closeWait = 0;
         confirmSlot = -1;
         rejoinTimer = connectTicks = connectAttempts = 0;
@@ -132,6 +162,7 @@ public class BoneSell extends Module {
 
     @Override
     public void onDeactivate() {
+        releaseMoveKeys();
         if (mc.player != null && menuOpen()) mc.player.closeHandledScreen();
     }
 
@@ -143,6 +174,22 @@ public class BoneSell extends Module {
         }
 
         if (mc.player == null || mc.world == null) return;
+
+        // While the automatic run is walking, we re-press the keys below as needed.
+        if (autoRun) releaseMoveKeys();
+
+        // Timer for the automatic sell-all.
+        if (autoSell.get()) {
+            long now = System.currentTimeMillis();
+            if (nextAutoAt == 0) {
+                nextAutoAt = now + intervalMs();
+                info("Auto sell-all is on: first run in " + autoHours.get() + " hours.");
+            } else if (!autoRun && step == Step.WAITING && cooldownTicks == 0 && !menuOpen() && now >= nextAutoAt) {
+                startAutoRun();
+            }
+        } else {
+            nextAutoAt = 0;
+        }
 
         if (timer > 0) {
             timer--;
@@ -168,6 +215,11 @@ public class BoneSell extends Module {
         }
         if (menuOpen()) return; // you're in some menu already, don't interfere
 
+        if (autoRun) {
+            autoStep();
+            return;
+        }
+
         BlockHitResult hit = lookedAtSpawner();
         if (hit == null) return;
 
@@ -191,9 +243,24 @@ public class BoneSell extends Module {
             return;
         }
 
-        // If you look away before it opens, just cancel - that's not a failure.
         BlockHitResult hit = lookedAtSpawner();
-        if (hit == null || !hit.getBlockPos().equals(target)) {
+        if (autoRun) {
+            // Automatic run: turn to the spawner ourselves.
+            lookAt(target);
+            hit = lookedAtSpawner();
+            if (hit == null || !hit.getBlockPos().equals(target)) {
+                if (++autoLookTicks > 40) {
+                    warning("Couldn't aim at the spawner at " + target.getX() + " " + target.getY() + " " + target.getZ() + " - skipping it.");
+                    autoQueue.remove(target);
+                    target = null;
+                    autoLookTicks = 0;
+                    step = Step.WAITING;
+                }
+                return;
+            }
+            autoLookTicks = 0;
+        } else if (hit == null || !hit.getBlockPos().equals(target)) {
+            // If you look away before it opens, just cancel - that's not a failure.
             say("You looked away - cancelled.");
             target = null;
             step = Step.WAITING;
@@ -313,6 +380,7 @@ public class BoneSell extends Module {
             rejoinStreak = 0;
             info("Sold. Look at the next spawner.");
         }
+        if (autoRun && target != null) autoQueue.remove(target);
         cooldownTicks = sold ? clickDelay.get() * 2 : 40;
         closeWait = 0;
         confirmClicksDone = 0;
@@ -398,6 +466,136 @@ public class BoneSell extends Module {
             return;
         }
         ConnectScreen.connect(new TitleScreen(), mc, ServerAddress.parse(lastServer.address), lastServer, false, null);
+    }
+
+    // ---------------------------------------------------------------- auto sell all
+
+    private long intervalMs() {
+        return (long) (autoHours.get() * 3_600_000.0);
+    }
+
+    private void runAutoNow() {
+        if (!isActive() || mc.player == null || mc.world == null) return;
+        if (autoRun || step != Step.WAITING || menuOpen()) {
+            warning("Busy right now - try again in a moment.");
+            return;
+        }
+        startAutoRun();
+    }
+
+    private void startAutoRun() {
+        double radius = autoRadius.get();
+        int r = (int) Math.ceil(radius);
+        List<BlockPos> found = new ArrayList<>();
+        BlockPos c = mc.player.getBlockPos();
+        for (int x = -r; x <= r; x++)
+            for (int y = -r; y <= r; y++)
+                for (int z = -r; z <= r; z++) {
+                    BlockPos p = c.add(x, y, z);
+                    if (mc.world.getBlockState(p).getBlock() != Blocks.SPAWNER) continue;
+                    if (mc.player.getEyePos().distanceTo(Vec3d.ofCenter(p)) <= radius) found.add(p);
+                }
+
+        // Nearest-neighbour order, so it flows from spawner to spawner.
+        List<BlockPos> ordered = new ArrayList<>();
+        Vec3d from = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+        while (!found.isEmpty()) {
+            BlockPos best = null;
+            double bestDist = Double.MAX_VALUE;
+            for (BlockPos p : found) {
+                double d = from.distanceTo(Vec3d.ofCenter(p));
+                if (d < bestDist) { bestDist = d; best = p; }
+            }
+            found.remove(best);
+            ordered.add(best);
+            from = Vec3d.ofCenter(best);
+        }
+
+        autoQueue.clear();
+        autoQueue.addAll(ordered);
+        nextAutoAt = System.currentTimeMillis() + intervalMs(); // next one, whatever happens
+
+        if (autoQueue.isEmpty()) {
+            info("Auto sell-all: no spawners within " + autoRadius.get() + " blocks.");
+            return;
+        }
+        autoRun = true;
+        walkTicks = 0;
+        autoLookTicks = 0;
+        info("Auto sell-all: selling " + autoQueue.size() + " spawner(s).");
+    }
+
+    /** One step of the automatic run: pick the next spawner, walk into reach, then hand over to the sell steps. */
+    private void autoStep() {
+        if (autoQueue.isEmpty()) {
+            finishAutoRun();
+            return;
+        }
+
+        BlockPos next = autoQueue.get(0);
+        if (mc.world.getBlockState(next).getBlock() != Blocks.SPAWNER) {
+            autoQueue.remove(0);
+            return;
+        }
+
+        Vec3d center = Vec3d.ofCenter(next);
+        if (mc.player.getEyePos().distanceTo(center) > 3.8) {
+            if (++walkTicks > 200) {
+                warning("Couldn't walk to the spawner at " + next.getX() + " " + next.getY() + " " + next.getZ() + " - skipping it.");
+                autoQueue.remove(0);
+                walkTicks = 0;
+                return;
+            }
+            walkToward(center);
+            return;
+        }
+
+        walkTicks = 0;
+        autoLookTicks = 0;
+        target = next;
+        openTicks = 0;
+        openCooldown = 0;
+        step = Step.OPENING;
+    }
+
+    private void finishAutoRun() {
+        autoRun = false;
+        releaseMoveKeys();
+        info("Auto sell-all finished. Next run in " + autoHours.get() + " hours.");
+    }
+
+    private void walkToward(Vec3d dest) {
+        double dx = dest.x - mc.player.getX();
+        double dz = dest.z - mc.player.getZ();
+        float targetYaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90f;
+        float d = MathHelper.wrapDegrees(targetYaw - mc.player.getYaw());
+        float stepYaw = Math.abs(d) < 1.5f ? d : MathHelper.clamp(d * 0.35f, -30f, 30f);
+        mc.player.setYaw(mc.player.getYaw() + stepYaw);
+
+        if (Math.abs(d) < 45f) mc.options.forwardKey.setPressed(true); // turn first, then walk
+        if (mc.player.horizontalCollision) mc.options.jumpKey.setPressed(true);
+    }
+
+    private void releaseMoveKeys() {
+        if (mc.options != null) {
+            mc.options.forwardKey.setPressed(false);
+            mc.options.jumpKey.setPressed(false);
+        }
+    }
+
+    /** Turn smoothly toward a block (used by the automatic run). */
+    private void lookAt(BlockPos pos) {
+        float targetYaw = (float) Rotations.getYaw(pos);
+        float targetPitch = (float) Rotations.getPitch(pos);
+
+        float dYaw = MathHelper.wrapDegrees(targetYaw - mc.player.getYaw());
+        float dPitch = targetPitch - mc.player.getPitch();
+
+        float stepYaw = Math.abs(dYaw) < 1.5f ? dYaw : MathHelper.clamp(dYaw * 0.35f, -30f, 30f);
+        float stepPitch = Math.abs(dPitch) < 1.5f ? dPitch : MathHelper.clamp(dPitch * 0.35f, -30f, 30f);
+
+        mc.player.setYaw(mc.player.getYaw() + stepYaw);
+        mc.player.setPitch(MathHelper.clamp(mc.player.getPitch() + stepPitch, -90f, 90f));
     }
 
     // ---------------------------------------------------------------- helpers
