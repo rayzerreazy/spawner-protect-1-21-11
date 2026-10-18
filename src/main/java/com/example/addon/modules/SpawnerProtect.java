@@ -14,6 +14,7 @@ import net.minecraft.block.Blocks;
 import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
+import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.sound.PositionedSoundInstance;
@@ -99,6 +100,18 @@ public class SpawnerProtect extends Module {
         .name("attempt-seconds").description("How long one attempt to break a block gets. After 2 failed attempts (anti-cheat) the block is skipped.")
         .defaultValue(5).min(2).sliderMax(20).build());
 
+    private final Setting<Double> extraSpawnerTime = sg.add(new DoubleSetting.Builder()
+        .name("extra-spawner-time").description("For slow connections: extra seconds spent on each spawner. Attempts last longer, and after a spawner vanishes it keeps standing there until the server has had time to confirm it.")
+        .defaultValue(0.5).min(0).max(10).sliderMax(5).decimalPlaces(1).build());
+
+    private final Setting<Double> extraShulkerTime = sg.add(new DoubleSetting.Builder()
+        .name("extra-shulker-time").description("The same extra time, for shulker boxes (breaking them and waiting for the drop).")
+        .defaultValue(1.0).min(0).max(10).sliderMax(5).decimalPlaces(1).build());
+
+    private final Setting<Boolean> lagCompensation = sg.add(new BoolSetting.Builder()
+        .name("lag-compensation").description("Also add extra waiting time automatically based on your ping (about twice your ping).")
+        .defaultValue(true).build());
+
     private final Setting<Integer> lookSpeed = sg.add(new IntSetting.Builder()
         .name("look-speed").description("Max degrees your view turns per tick when facing a block.")
         .defaultValue(25).min(1).sliderMax(90).build());
@@ -156,6 +169,9 @@ public class SpawnerProtect extends Module {
     private BlockPos pendingBreak; // a block that vanished; waiting to see if the server really broke it
     private int pendingTicks;
     private int delayTicks;
+    private int pendingNeeded = 12;
+    private int shulkerGone;
+    private boolean mineTargetShulker;
     private boolean retriedSkipped, chestOpenSeen, boxOpenSeen, shulkerDisabled, noRejoin, panicking;
     private boolean shulkersUnlocked, midRunDeposit;
     private final Set<Integer> ignoredDrops = new HashSet<>();
@@ -189,6 +205,9 @@ public class SpawnerProtect extends Module {
         pendingBreak = null;
         pendingTicks = 0;
         delayTicks = 0;
+        pendingNeeded = 12;
+        shulkerGone = 0;
+        mineTargetShulker = false;
         retriedSkipped = chestOpenSeen = boxOpenSeen = shulkerDisabled = noRejoin = panicking = false;
         shulkersUnlocked = midRunDeposit = false;
         packRounds = shulkerItemsBefore = collectTicks = 0;
@@ -283,18 +302,22 @@ public class SpawnerProtect extends Module {
                 BlockPos back = pendingBreak;
                 pendingBreak = null;
                 failAttempt(back, "The server put the block back (it was not really broken).");
-            } else if (++pendingTicks >= 12) {
+            } else if (++pendingTicks >= pendingNeeded) {
                 handled++;
                 beep(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.3f);
                 attempts.remove(pendingBreak);
                 pendingBreak = null;
+                delayTicks = (int) Math.round(mineDelay.get() * 20); // 20 ticks per second
+            } else {
+                return; // stay put while the server catches up (slow connections)
             }
         }
         if (pendingBreak == null && mineTarget != null && !isMineable(mineTarget)) {
             pendingBreak = mineTarget;
             pendingTicks = 0;
             mineTarget = null;
-            delayTicks = (int) Math.round(mineDelay.get() * 20); // 20 ticks per second
+            pendingNeeded = 12 + lagTicks(mineTargetShulker ? extraShulkerTime.get() : extraSpawnerTime.get());
+            return;
         }
 
         // A skipped block only gets another go after 2 other blocks were mined (or given up on).
@@ -368,6 +391,7 @@ public class SpawnerProtect extends Module {
 
         if (!target.equals(mineTarget)) {
             mineTarget = target;
+            mineTargetShulker = forShulker;
             mineTicks = 0;
             info("Mining " + (forShulker ? "the shulker box" : "the spawner") + " at " + target.getX() + " "
                 + target.getY() + " " + target.getZ() + ".");
@@ -385,7 +409,7 @@ public class SpawnerProtect extends Module {
         }
 
         // One attempt = attempt-seconds of trying. After 2 failed attempts, skip the block.
-        if (++mineTicks > attemptSeconds.get() * 20) {
+        if (++mineTicks > attemptSeconds.get() * 20 + lagTicks(forShulker ? extraShulkerTime.get() : extraSpawnerTime.get())) {
             failAttempt(target, "Not broken in time.");
             return;
         }
@@ -454,7 +478,7 @@ public class SpawnerProtect extends Module {
         }
 
         // Nothing on the ground right now. Wait a moment: drops can take a second to appear.
-        if (++waitTicks < 30) return;
+        if (++waitTicks < 30 + lagTicks(0)) return;
 
         if (verifyPasses < MAX_VERIFY_PASSES) {
             waitTicks = 0;
@@ -467,7 +491,7 @@ public class SpawnerProtect extends Module {
     // ---------------------------------------------------------------- double check
 
     private void verify() {
-        if (++waitTicks < 20) return; // give the server a second to settle
+        if (++waitTicks < 20 + lagTicks(0)) return; // give the server a second to settle
 
         if (hasUnskippedTarget()) {
             verifyPasses++;
@@ -916,18 +940,26 @@ public class SpawnerProtect extends Module {
         lookTicks = 0;
         collectTicks = 0;
         shulkerItemsBefore = countShulkerItems();
+        shulkerGone = 0;
         state = State.SHULKER_BREAK;
     }
 
     /** Break the loaded shulker box so it drops as an item. */
     private void shulkerBreakStep() {
-        if (shulkerPos == null || !(mc.world.getBlockState(shulkerPos).getBlock() instanceof ShulkerBoxBlock)) {
-            waitTicks = 0;
-            state = State.SHULKER_COLLECT;
+        boolean gone = shulkerPos == null || !(mc.world.getBlockState(shulkerPos).getBlock() instanceof ShulkerBoxBlock);
+        if (gone) {
+            // Stay put until the server has had time to confirm it (slow connections).
+            // If the box comes back meanwhile, the next tick just keeps breaking it.
+            if (++shulkerGone >= 12 + lagTicks(extraShulkerTime.get())) {
+                shulkerGone = 0;
+                waitTicks = 0;
+                state = State.SHULKER_COLLECT;
+            }
             return;
         }
+        shulkerGone = 0;
 
-        if (++shulkerTicks > 400) {
+        if (++shulkerTicks > 400 + lagTicks(extraShulkerTime.get())) {
             shulkerFail("Couldn't break the shulker box");
             return;
         }
@@ -971,13 +1003,29 @@ public class SpawnerProtect extends Module {
         }
 
         // The drop can take a couple of seconds to appear on a laggy server.
-        if (++waitTicks < 60) return;
+        if (++waitTicks < 60 + lagTicks(extraShulkerTime.get())) return;
 
         // The normal collect step will still hunt it down later.
         shulkerFail("The broken shulker box never showed up");
     }
 
     // ---------------------------------------------------------------- helpers
+
+    /** Extra ticks to wait: the extra seconds you chose, plus about twice your ping if lag-compensation is on. */
+    private int lagTicks(double extraSeconds) {
+        int ticks = (int) Math.round(extraSeconds * 20);
+        if (lagCompensation.get()) ticks += Math.min(100, (int) Math.ceil(latencyMs() / 25.0));
+        return ticks;
+    }
+
+    private int latencyMs() {
+        try {
+            PlayerListEntry entry = mc.getNetworkHandler().getPlayerListEntry(mc.player.getUuid());
+            return entry == null ? 0 : entry.getLatency();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
 
     private void beep(SoundEvent sound, float pitch) {
         if (!sounds.get() || soundVolume.get() == 0) return;
