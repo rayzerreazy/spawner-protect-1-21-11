@@ -14,7 +14,6 @@ import net.minecraft.block.Blocks;
 import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
-import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.sound.PositionedSoundInstance;
@@ -100,6 +99,10 @@ public class SpawnerProtect extends Module {
         .name("attempt-seconds").description("How long one attempt to break a block gets. After 2 failed attempts (anti-cheat) the block is skipped.")
         .defaultValue(5).min(2).sliderMax(20).build());
 
+    private final Setting<Double> mineReach = sg.add(new DoubleSetting.Builder()
+        .name("mine-reach").description("Stand this close (in blocks) to a block before mining it. Closer is safer on servers that check reach. Vanilla max is about 4.5.")
+        .defaultValue(3.8).min(2).max(4.5).sliderMax(4.5).decimalPlaces(1).build());
+
     private final Setting<Double> extraSpawnerTime = sg.add(new DoubleSetting.Builder()
         .name("extra-spawner-time").description("For slow connections: extra seconds spent on each spawner. Attempts last longer, and after a spawner vanishes it keeps standing there until the server has had time to confirm it.")
         .defaultValue(0.5).min(0).max(10).sliderMax(5).decimalPlaces(1).build());
@@ -107,10 +110,6 @@ public class SpawnerProtect extends Module {
     private final Setting<Double> extraShulkerTime = sg.add(new DoubleSetting.Builder()
         .name("extra-shulker-time").description("The same extra time, for shulker boxes (breaking them and waiting for the drop).")
         .defaultValue(1.0).min(0).max(10).sliderMax(5).decimalPlaces(1).build());
-
-    private final Setting<Boolean> lagCompensation = sg.add(new BoolSetting.Builder()
-        .name("lag-compensation").description("Also add extra waiting time automatically based on your ping (about twice your ping).")
-        .defaultValue(true).build());
 
     private final Setting<Integer> lookSpeed = sg.add(new IntSetting.Builder()
         .name("look-speed").description("Max degrees your view turns per tick when facing a block.")
@@ -172,6 +171,8 @@ public class SpawnerProtect extends Module {
     private int pendingNeeded = 12;
     private int shulkerGone;
     private boolean mineTargetShulker;
+    private BlockPos lastMined, stackCheck;
+    private int stackCheckTicks, stackBaseline, pendingBaseline, lastSpawnerSignal, settleTicks, aimWait, walkTicks;
     private boolean retriedSkipped, chestOpenSeen, boxOpenSeen, shulkerDisabled, noRejoin, panicking;
     private boolean shulkersUnlocked, midRunDeposit;
     private final Set<Integer> ignoredDrops = new HashSet<>();
@@ -185,7 +186,7 @@ public class SpawnerProtect extends Module {
     public void onActivate() { reset(); }
 
     @Override
-    public void onDeactivate() { stopWalking(); reset(); }
+    public void onDeactivate() { releaseAllKeys(); reset(); }
 
     private void reset() {
         state = State.IDLE;
@@ -208,6 +209,9 @@ public class SpawnerProtect extends Module {
         pendingNeeded = 12;
         shulkerGone = 0;
         mineTargetShulker = false;
+        lastMined = stackCheck = null;
+        stackCheckTicks = stackBaseline = pendingBaseline = lastSpawnerSignal = 0;
+        settleTicks = aimWait = walkTicks = 0;
         retriedSkipped = chestOpenSeen = boxOpenSeen = shulkerDisabled = noRejoin = panicking = false;
         shulkersUnlocked = midRunDeposit = false;
         packRounds = shulkerItemsBefore = collectTicks = 0;
@@ -228,6 +232,9 @@ public class SpawnerProtect extends Module {
         // so you can still walk around normally while the module is just watching.
         if (state != State.IDLE) {
             stopWalking();
+            // Hold crouch for the whole mining phase (no un-crouching between blocks);
+            // it's released as soon as we move on to storing things.
+            mc.options.sneakKey.setPressed(state == State.MINING);
             ticksActive++;
             if (timeout.get() > 0 && ticksActive > timeout.get() * 20
                 && state != State.LEAVE && state != State.DEPOSIT) {
@@ -295,26 +302,47 @@ public class SpawnerProtect extends Module {
     private void mine() {
         if (maybeStartShulker(State.MINING)) return;
 
-        // A block that vanished may just be the client guessing: the server can put it back
-        // (anti-cheat, timing, tool mismatch). Only count it as mined once it has stayed gone.
+        // Did the server put a "broken" block back? A STACKED spawner also comes back (one is taken
+        // off the stack and you get an item), so wait a moment to see if an item appears.
+        if (stackCheck != null) {
+            if (spawnerSignal() > stackBaseline) {
+                info("Took one spawner off a stack at " + stackCheck.getX() + " " + stackCheck.getY() + " "
+                    + stackCheck.getZ() + " - carrying on with the same block.");
+                attempts.remove(stackCheck);
+                stackCheck = null;
+            } else if (++stackCheckTicks >= 10) {
+                BlockPos back = stackCheck;
+                stackCheck = null;
+                failAttempt(back, "The server put the block back (it was not really broken).");
+                return;
+            } else {
+                return;
+            }
+        }
+
+        // A block that vanished may just be the client guessing. Only count it as mined once it has stayed gone.
         if (pendingBreak != null) {
             if (isMineable(pendingBreak)) {
-                BlockPos back = pendingBreak;
+                stackCheck = pendingBreak;
+                stackCheckTicks = 0;
+                stackBaseline = pendingBaseline;
                 pendingBreak = null;
-                failAttempt(back, "The server put the block back (it was not really broken).");
+                return;
             } else if (++pendingTicks >= pendingNeeded) {
                 handled++;
                 beep(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.3f);
                 attempts.remove(pendingBreak);
+                lastMined = pendingBreak;
                 pendingBreak = null;
                 delayTicks = (int) Math.round(mineDelay.get() * 20); // 20 ticks per second
             } else {
-                return; // stay put while the server catches up (slow connections)
+                return; // stay put while the server catches up
             }
         }
         if (pendingBreak == null && mineTarget != null && !isMineable(mineTarget)) {
             pendingBreak = mineTarget;
             pendingTicks = 0;
+            pendingBaseline = lastSpawnerSignal;
             mineTarget = null;
             pendingNeeded = 12 + lagTicks(mineTargetShulker ? extraShulkerTime.get() : extraSpawnerTime.get());
             return;
@@ -379,20 +407,37 @@ public class SpawnerProtect extends Module {
             return;
         }
 
-        BlockPos target = targets.get(0);
+        // Smooth pattern: always take the block closest to the one we just finished,
+        // so the camera and movement flow from block to block instead of jumping around.
+        BlockPos anchor = lastMined != null ? lastMined : mc.player.getBlockPos();
+        List<BlockPos> ordered = new ArrayList<>(targets);
+        ordered.sort(Comparator.comparingDouble(p -> p.getSquaredDistance(anchor)));
+        BlockPos target = (mineTarget != null && ordered.contains(mineTarget)) ? mineTarget : ordered.get(0);
         Vec3d center = Vec3d.ofCenter(target);
 
-        if (mc.player.getEyePos().distanceTo(center) > 4.3) {
-            walkTo(center);
-            return;
+        // Stand close, so the server agrees the block is in reach.
+        double dist = mc.player.getEyePos().distanceTo(center);
+        if (dist > mineReach.get()) {
+            boolean stuck = ++walkTicks > 60 && dist <= 4.4; // walls in the way: mine from where we are
+            if (!stuck) {
+                walkTo(center);
+                return;
+            }
+        } else {
+            walkTicks = 0;
         }
 
-        if (!forShulker) mc.options.sneakKey.setPressed(true); // crouch while breaking spawners
+        // Let the server see us standing still before we start.
+        if (settleTicks > 0) {
+            settleTicks--;
+            return;
+        }
 
         if (!target.equals(mineTarget)) {
             mineTarget = target;
             mineTargetShulker = forShulker;
             mineTicks = 0;
+            lastSpawnerSignal = spawnerSignal();
             info("Mining " + (forShulker ? "the shulker box" : "the spawner") + " at " + target.getX() + " "
                 + target.getY() + " " + target.getZ() + ".");
         }
@@ -400,13 +445,28 @@ public class SpawnerProtect extends Module {
         if (!target.equals(lookTarget)) {
             lookTarget = target;
             lookTicks = 0;
+            aimWait = 0;
         }
-        // Turn to the block only if we aren't already aimed at it, then hold the aim steady.
+        // Turn smoothly to the block only if we aren't already aimed at it, then hold the aim steady.
         // If something is in the way and it never lines up, stop waiting after 2 seconds.
         if (!isLookingAt(target)) {
             lookAt(target);
             if (!isLookingAt(target) && ++lookTicks < 40) return;
         }
+        // Hold the aim for a moment before the first break packet.
+        if (aimWait < 2) {
+            aimWait++;
+            return;
+        }
+
+        // Stacked spawner: an item appeared while the block is still there = progress, not a failure.
+        int signal = spawnerSignal();
+        if (signal > lastSpawnerSignal) {
+            mineTicks = 0;
+            attempts.remove(target);
+            info("Took one spawner off a stack - carrying on with the same block.");
+        }
+        lastSpawnerSignal = signal;
 
         // One attempt = attempt-seconds of trying. After 2 failed attempts, skip the block.
         if (++mineTicks > attemptSeconds.get() * 20 + lagTicks(forShulker ? extraShulkerTime.get() : extraSpawnerTime.get())) {
@@ -422,6 +482,8 @@ public class SpawnerProtect extends Module {
         int n = attempts.merge(target, 1, Integer::sum);
         mineTicks = 0;
         lookTicks = 0;
+        aimWait = 0;
+        delayTicks = Math.max(delayTicks, 10); // give the server half a second to settle before retrying
         String where = target.getX() + " " + target.getY() + " " + target.getZ();
         if (n >= MAX_ATTEMPTS) {
             skipped.add(target);
@@ -435,6 +497,7 @@ public class SpawnerProtect extends Module {
         }
     }
 
+    /** Turn smoothly: each tick move a fraction of the remaining angle (capped by look-speed). */
     private void lookAt(BlockPos pos) {
         float targetYaw = (float) Rotations.getYaw(pos);
         float targetPitch = (float) Rotations.getPitch(pos);
@@ -443,8 +506,11 @@ public class SpawnerProtect extends Module {
         float dYaw = MathHelper.wrapDegrees(targetYaw - mc.player.getYaw());
         float dPitch = targetPitch - mc.player.getPitch();
 
-        mc.player.setYaw(mc.player.getYaw() + MathHelper.clamp(dYaw, -max, max));
-        mc.player.setPitch(MathHelper.clamp(mc.player.getPitch() + MathHelper.clamp(dPitch, -max, max), -90f, 90f));
+        float stepYaw = Math.abs(dYaw) < 1.5f ? dYaw : MathHelper.clamp(dYaw * 0.35f, -max, max);
+        float stepPitch = Math.abs(dPitch) < 1.5f ? dPitch : MathHelper.clamp(dPitch * 0.35f, -max, max);
+
+        mc.player.setYaw(mc.player.getYaw() + stepYaw);
+        mc.player.setPitch(MathHelper.clamp(mc.player.getPitch() + stepPitch, -90f, 90f));
     }
 
     private boolean isLookingAt(BlockPos pos) {
@@ -478,7 +544,7 @@ public class SpawnerProtect extends Module {
         }
 
         // Nothing on the ground right now. Wait a moment: drops can take a second to appear.
-        if (++waitTicks < 30 + lagTicks(0)) return;
+        if (++waitTicks < 30) return;
 
         if (verifyPasses < MAX_VERIFY_PASSES) {
             waitTicks = 0;
@@ -491,7 +557,7 @@ public class SpawnerProtect extends Module {
     // ---------------------------------------------------------------- double check
 
     private void verify() {
-        if (++waitTicks < 20 + lagTicks(0)) return; // give the server a second to settle
+        if (++waitTicks < 20) return; // give the server a second to settle
 
         if (hasUnskippedTarget()) {
             verifyPasses++;
@@ -549,7 +615,7 @@ public class SpawnerProtect extends Module {
     private void startDeposit() {
         midRunDeposit = false;
         noProgressTicks = 0;
-        openCooldown = 0;
+        openCooldown = 6;
         chestLookTicks = 0;
         chestOpenSeen = false;
         state = State.DEPOSIT;
@@ -684,7 +750,7 @@ public class SpawnerProtect extends Module {
     // ---------------------------------------------------------------- leaving
 
     private void leave() {
-        stopWalking();
+        releaseAllKeys();
         if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler
             || mc.player.currentScreenHandler instanceof ShulkerBoxScreenHandler) mc.player.closeHandledScreen();
 
@@ -829,7 +895,7 @@ public class SpawnerProtect extends Module {
     private void beginShulkerCycle(State resume, String message) {
         resumeState = resume;
         noProgressTicks = 0;
-        openCooldown = 0;
+        openCooldown = 6;
         chestLookTicks = 0;
         lookTicks = 0;
         shulkerTicks = 0;
@@ -1011,20 +1077,9 @@ public class SpawnerProtect extends Module {
 
     // ---------------------------------------------------------------- helpers
 
-    /** Extra ticks to wait: the extra seconds you chose, plus about twice your ping if lag-compensation is on. */
+    /** Extra ticks to wait: just the extra seconds you chose. */
     private int lagTicks(double extraSeconds) {
-        int ticks = (int) Math.round(extraSeconds * 20);
-        if (lagCompensation.get()) ticks += Math.min(100, (int) Math.ceil(latencyMs() / 25.0));
-        return ticks;
-    }
-
-    private int latencyMs() {
-        try {
-            PlayerListEntry entry = mc.getNetworkHandler().getPlayerListEntry(mc.player.getUuid());
-            return entry == null ? 0 : entry.getLatency();
-        } catch (Exception e) {
-            return 0;
-        }
+        return (int) Math.round(extraSeconds * 20);
     }
 
     private void beep(SoundEvent sound, float pitch) {
@@ -1032,6 +1087,17 @@ public class SpawnerProtect extends Module {
         try {
             mc.getSoundManager().play(PositionedSoundInstance.master(sound, pitch, soundVolume.get() / 100f));
         } catch (Exception ignored) { }
+    }
+
+    /** Spawner items we hold plus spawner items lying nearby - goes up when a spawner is taken off a stack. */
+    private int spawnerSignal() {
+        int n = countSpawners();
+        for (ItemEntity e : mc.world.getEntitiesByClass(ItemEntity.class,
+                mc.player.getBoundingBox().expand(spawnerRange.get() + 4),
+                i -> i.getStack().isOf(Items.SPAWNER))) {
+            n += e.getStack().getCount();
+        }
+        return n;
     }
 
     private boolean isMineable(BlockPos pos) {
@@ -1185,16 +1251,27 @@ public class SpawnerProtect extends Module {
     private void walkTo(Vec3d target) {
         double dx = target.x - mc.player.getX();
         double dz = target.z - mc.player.getZ();
-        mc.player.setYaw((float) Math.toDegrees(Math.atan2(dz, dx)) - 90f);
-        mc.options.forwardKey.setPressed(true);
+        float targetYaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90f;
+        float d = MathHelper.wrapDegrees(targetYaw - mc.player.getYaw());
+        float max = lookSpeed.get();
+
+        float step = Math.abs(d) < 1.5f ? d : MathHelper.clamp(d * 0.35f, -max, max);
+        mc.player.setYaw(mc.player.getYaw() + step);
+
+        if (Math.abs(d) < 45f) mc.options.forwardKey.setPressed(true); // turn first, then walk
         if (mc.player.horizontalCollision) mc.options.jumpKey.setPressed(true);
+        settleTicks = 4; // stand still a moment once we arrive
     }
 
     private void stopWalking() {
         if (mc.options != null) {
             mc.options.forwardKey.setPressed(false);
             mc.options.jumpKey.setPressed(false);
-            mc.options.sneakKey.setPressed(false);
         }
+    }
+
+    private void releaseAllKeys() {
+        stopWalking();
+        if (mc.options != null) mc.options.sneakKey.setPressed(false);
     }
 }
