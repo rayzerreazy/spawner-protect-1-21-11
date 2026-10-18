@@ -15,6 +15,7 @@ import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
 import net.minecraft.client.network.ServerAddress;
+import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.network.ServerInfo;
 import net.minecraft.client.sound.PositionedSoundInstance;
 import net.minecraft.component.DataComponentTypes;
@@ -234,7 +235,7 @@ public class SpawnerProtect extends Module {
             stopWalking();
             // Hold crouch for the whole mining phase (no un-crouching between blocks);
             // it's released as soon as we move on to storing things.
-            mc.options.sneakKey.setPressed(state == State.MINING);
+            setKey(mc.options.sneakKey, state == State.MINING);
             ticksActive++;
             if (timeout.get() > 0 && ticksActive > timeout.get() * 20
                 && state != State.LEAVE && state != State.DEPOSIT) {
@@ -1276,6 +1277,18 @@ public class SpawnerProtect extends Module {
 
     private void releaseAllKeys() {
         stopWalking();
-        if (mc.options != null) mc.options.sneakKey.setPressed(false);
+        if (mc.options != null) setKey(mc.options.sneakKey, false);
+    }
+
+    /**
+     * Put a key in the wanted state, but only change it if it isn't already there.
+     * If the player has "Sneak: Toggle" on, calling setPressed(true) every tick would flip
+     * crouch on and off every tick - so we only touch it when it needs to change, and in toggle
+     * mode we "press" it once more to flip it the way we want.
+     */
+    private void setKey(KeyBinding key, boolean down) {
+        if (key.isPressed() == down) return;
+        key.setPressed(down);
+        if (key.isPressed() != down) key.setPressed(true); // toggle-mode keys flip on each press
     }
 }
