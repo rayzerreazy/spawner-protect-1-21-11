@@ -1,11 +1,16 @@
 package com.example.addon.modules;
 
 import com.example.addon.AddonTemplate;
+import meteordevelopment.meteorclient.events.render.Render3DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.meteorclient.utils.player.Rotations;
+import meteordevelopment.meteorclient.utils.render.color.Color;
+import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.gui.screen.TitleScreen;
@@ -26,13 +31,16 @@ import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Bone Sell (Meteor Client addon module, Fabric 1.21.11, Yarn mappings)
@@ -64,6 +72,10 @@ public class BoneSell extends Module {
         .name("reach").description("How far away a spawner can be for the macro to start.")
         .defaultValue(4.5).min(1).max(5).sliderMax(5).decimalPlaces(1).build());
 
+    private final Setting<Boolean> lookBeforeOpening = sgGeneral.add(new BoolSetting.Builder()
+        .name("look-before-opening").description("Turn your camera to the spawner before opening it during the automatic run. Off = open it without turning to it.")
+        .defaultValue(false).build());
+
     private final Setting<Boolean> debugMenu = sgGeneral.add(new BoolSetting.Builder()
         .name("debug-menu").description("Print the name of every item in the menu to chat. Turn this on to find the right button words.")
         .defaultValue(false).build());
@@ -91,8 +103,8 @@ public class BoneSell extends Module {
 
     // ---- Rejoin
     private final Setting<Double> openTimeout = sgRejoin.add(new DoubleSetting.Builder()
-        .name("open-timeout-seconds").description("If the spawner menu hasn't opened after this long (while you keep looking at it), leave and rejoin.")
-        .defaultValue(5).min(1).max(30).sliderMax(15).decimalPlaces(1).build());
+        .name("open-timeout-seconds").description("Total time to keep trying to open a spawner (it tries different things as it goes: crouch off, empty hand, moving closer, stepping sideways, hopping). After this, it leaves and rejoins.")
+        .defaultValue(10).min(1).max(30).sliderMax(15).decimalPlaces(1).build());
 
     private final Setting<Integer> rejoinDelay = sgRejoin.add(new IntSetting.Builder()
         .name("rejoin-delay-seconds").description("Seconds to wait before rejoining.")
@@ -115,6 +127,18 @@ public class BoneSell extends Module {
         .name("auto-radius").description("Sell the spawners within this many blocks of you.")
         .defaultValue(10).min(1).max(32).sliderMax(32).build());
 
+    private final Setting<Keybind> selectKey = sgAuto.add(new KeybindSetting.Builder()
+        .name("select-key").description("Look at a spawner and press this to add it to (or remove it from) the selection. If anything is selected, sell-all only sells the selected spawners.")
+        .defaultValue(Keybind.none()).action(this::toggleSelected).build());
+
+    private final Setting<Keybind> clearSelectionKey = sgAuto.add(new KeybindSetting.Builder()
+        .name("clear-selection-key").description("Press to clear the selection (sell-all then covers every spawner in the radius again).")
+        .defaultValue(Keybind.none()).action(this::clearSelected).build());
+
+    private final Setting<SettingColor> highlightColor = sgAuto.add(new ColorSetting.Builder()
+        .name("highlight-color").description("Colour of the box drawn around selected spawners.")
+        .defaultValue(new SettingColor(255, 170, 0, 255)).build());
+
     private final Setting<Keybind> autoRunKey = sgAuto.add(new KeybindSetting.Builder()
         .name("sell-all-now-key").description("Press to run the sell-all right now (handy for testing).")
         .defaultValue(Keybind.none()).action(this::runAutoNow).build());
@@ -128,6 +152,7 @@ public class BoneSell extends Module {
     private int cooldownTicks, timer, openTicks, openCooldown, tries;
     private int failedSells, rejoinStreak;
     private boolean autoRun;
+    private final Set<BlockPos> selected = new HashSet<>();
     private final List<BlockPos> autoQueue = new ArrayList<>();
     private long nextAutoAt;
     private int walkTicks, autoLookTicks, stuckTicks;
@@ -242,6 +267,7 @@ public class BoneSell extends Module {
         if (menuOpen()) {
             say("Spawner menu open.");
             rejoinStreak = 0;
+            stopSprint();
             logMenu();
             tries = 0;
             timer = clickDelay.get();
@@ -249,40 +275,89 @@ public class BoneSell extends Module {
             return;
         }
 
-        BlockHitResult hit = lookedAtSpawner();
-        if (autoRun) {
-            // Automatic run: turn to the spawner ourselves.
-            lookAt(target);
-            hit = lookedAtSpawner();
-            if (hit == null || !hit.getBlockPos().equals(target)) {
-                if (++autoLookTicks > 40) {
-                    warning("Couldn't aim at the spawner at " + target.getX() + " " + target.getY() + " " + target.getZ() + " - skipping it.");
-                    autoQueue.remove(target);
-                    target = null;
-                    autoLookTicks = 0;
-                    step = Step.WAITING;
-                }
-                return;
-            }
-            autoLookTicks = 0;
-        } else if (hit == null || !hit.getBlockPos().equals(target)) {
-            // If you look away before it opens, just cancel - that's not a failure.
-            say("You looked away - cancelled.");
-            target = null;
-            step = Step.WAITING;
+        if (target == null || mc.world.getBlockState(target).getBlock() != Blocks.SPAWNER) {
+            warning("That spawner is gone - skipping it.");
+            finishCycle(false);
             return;
         }
 
+        BlockHitResult looked = lookedAtSpawner();
+        boolean aimed = looked != null && looked.getBlockPos().equals(target);
+
+        if (!autoRun) {
+            // Manual: you aim. If you look away before it opens, just cancel - that's not a failure.
+            if (!aimed) {
+                say("You looked away - cancelled.");
+                target = null;
+                step = Step.WAITING;
+                return;
+            }
+        } else if (lookBeforeOpening.get()) {
+            lookAt(target);
+            looked = lookedAtSpawner();
+            aimed = looked != null && looked.getBlockPos().equals(target);
+            if (!aimed && ++autoLookTicks < 40) return; // give it 2 seconds to line up
+        }
+
         if (++openTicks > openTimeout.get() * 20) {
+            stopSprint();
             failOpen();
             return;
         }
 
-        if (openCooldown-- > 0) return;
-        openCooldown = 20; // retry the click once a second
+        // Try something different every second until it opens.
+        applyTactic((openTicks / 20) % (autoRun ? 7 : 3));
 
-        mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+        if (openCooldown-- > 0) return;
+        openCooldown = 10;
+
+        // Click what we're really aimed at, or else the face of the block that points at us.
+        BlockHitResult use = aimed ? looked : faceHit(target);
+        mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, use);
         mc.player.swingHand(Hand.MAIN_HAND);
+    }
+
+    /**
+     * Things to try when a spawner won't open:
+     * 0 as is, 1 crouch off (a crouching player holding an item can't open things), 2 empty hand,
+     * 3 move closer, 4 step left, 5 step right, 6 hop. (3-6 only in the automatic run.)
+     */
+    private void applyTactic(int tactic) {
+        if (tactic != 3) stopSprint();
+        switch (tactic) {
+            case 1 -> setKey(mc.options.sneakKey, false);
+            case 2 -> {
+                setKey(mc.options.sneakKey, false);
+                selectEmptySlot();
+            }
+            case 3 -> {
+                setKey(mc.options.sneakKey, false);
+                Vec3d center = Vec3d.ofCenter(target);
+                if (mc.player.getEyePos().distanceTo(center) > 2.2) runToward(center, false);
+            }
+            case 4 -> mc.options.leftKey.setPressed(true);
+            case 5 -> mc.options.rightKey.setPressed(true);
+            case 6 -> mc.options.jumpKey.setPressed(true);
+            default -> { }
+        }
+    }
+
+    private void selectEmptySlot() {
+        for (int i = 0; i < 9; i++) {
+            if (mc.player.getInventory().getStack(i).isEmpty()) {
+                InvUtils.swap(i, false);
+                return;
+            }
+        }
+    }
+
+    /** A click on the face of the block that points toward us (no need to be aiming at it). */
+    private BlockHitResult faceHit(BlockPos pos) {
+        Vec3d center = Vec3d.ofCenter(pos);
+        Vec3d d = mc.player.getEyePos().subtract(center);
+        Direction side = Direction.getFacing(d.x, d.y, d.z);
+        Vec3d hitVec = center.add(side.getOffsetX() * 0.5, side.getOffsetY() * 0.5, side.getOffsetZ() * 0.5);
+        return new BlockHitResult(hitVec, side, pos, false);
     }
 
     private void sell() {
@@ -474,6 +549,44 @@ public class BoneSell extends Module {
         ConnectScreen.connect(new TitleScreen(), mc, ServerAddress.parse(lastServer.address), lastServer, false, null);
     }
 
+    // ---------------------------------------------------------------- selection
+
+    private void toggleSelected() {
+        if (!isActive() || mc.player == null || mc.world == null) return;
+        HitResult hit = mc.player.raycast(30, 1f, false);
+        if (hit instanceof BlockHitResult bhr
+            && mc.world.getBlockState(bhr.getBlockPos()).getBlock() == Blocks.SPAWNER) {
+            BlockPos p = bhr.getBlockPos().toImmutable();
+            if (selected.remove(p)) {
+                info("Unselected the spawner at " + p.getX() + " " + p.getY() + " " + p.getZ() + " (" + selected.size() + " selected).");
+            } else {
+                selected.add(p);
+                info("Selected the spawner at " + p.getX() + " " + p.getY() + " " + p.getZ() + " (" + selected.size() + " selected).");
+            }
+        } else {
+            warning("Look at a spawner first.");
+        }
+    }
+
+    private void clearSelected() {
+        if (!isActive()) return;
+        selected.clear();
+        info("Selection cleared.");
+    }
+
+    @EventHandler
+    private void onRender(Render3DEvent event) {
+        if (selected.isEmpty() || mc.world == null) return;
+        SettingColor c = highlightColor.get();
+        Color side = new Color(c.r, c.g, c.b, 50);
+        Color line = new Color(c.r, c.g, c.b, 255);
+        for (BlockPos p : selected) {
+            if (mc.world.getBlockState(p).getBlock() == Blocks.SPAWNER) {
+                event.renderer.box(p, side, line, ShapeMode.Both, 0);
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- auto sell all
 
     private long intervalMs() {
@@ -491,16 +604,23 @@ public class BoneSell extends Module {
 
     private void startAutoRun() {
         double radius = autoRadius.get();
-        int r = (int) Math.ceil(radius);
         List<BlockPos> found = new ArrayList<>();
-        BlockPos c = mc.player.getBlockPos();
-        for (int x = -r; x <= r; x++)
-            for (int y = -r; y <= r; y++)
-                for (int z = -r; z <= r; z++) {
-                    BlockPos p = c.add(x, y, z);
-                    if (mc.world.getBlockState(p).getBlock() != Blocks.SPAWNER) continue;
-                    if (mc.player.getEyePos().distanceTo(Vec3d.ofCenter(p)) <= radius) found.add(p);
-                }
+        if (!selected.isEmpty()) {
+            // You picked specific spawners: sell only those (wherever they are).
+            for (BlockPos p : selected) {
+                if (mc.world.getBlockState(p).getBlock() == Blocks.SPAWNER) found.add(p);
+            }
+        } else {
+            int r = (int) Math.ceil(radius);
+            BlockPos c = mc.player.getBlockPos();
+            for (int x = -r; x <= r; x++)
+                for (int y = -r; y <= r; y++)
+                    for (int z = -r; z <= r; z++) {
+                        BlockPos p = c.add(x, y, z);
+                        if (mc.world.getBlockState(p).getBlock() != Blocks.SPAWNER) continue;
+                        if (mc.player.getEyePos().distanceTo(Vec3d.ofCenter(p)) <= radius) found.add(p);
+                    }
+        }
 
         // Nearest-neighbour order, so it flows from spawner to spawner.
         List<BlockPos> ordered = new ArrayList<>();
@@ -522,7 +642,7 @@ public class BoneSell extends Module {
         nextAutoAt = System.currentTimeMillis() + intervalMs(); // next one, whatever happens
 
         if (autoQueue.isEmpty()) {
-            info("Auto sell-all: no spawners within " + autoRadius.get() + " blocks.");
+            info(selected.isEmpty() ? "Auto sell-all: no spawners within " + autoRadius.get() + " blocks." : "Auto sell-all: none of the selected spawners exist any more.");
             return;
         }
         autoRun = true;
