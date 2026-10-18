@@ -97,7 +97,7 @@ public class SpawnerProtect extends Module {
 
     private final Setting<Integer> attemptSeconds = sg.add(new IntSetting.Builder()
         .name("attempt-seconds").description("How long one attempt to break a block gets. After 2 failed attempts (anti-cheat) the block is skipped.")
-        .defaultValue(5).min(2).sliderMax(20).build());
+        .defaultValue(3).min(1).sliderMax(20).build());
 
     private final Setting<Double> mineReach = sg.add(new DoubleSetting.Builder()
         .name("mine-reach").description("Stand this close (in blocks) to a block before mining it. Closer is safer on servers that check reach. Vanilla max is about 4.5.")
@@ -105,11 +105,11 @@ public class SpawnerProtect extends Module {
 
     private final Setting<Double> extraSpawnerTime = sg.add(new DoubleSetting.Builder()
         .name("extra-spawner-time").description("For slow connections: extra seconds spent on each spawner. Attempts last longer, and after a spawner vanishes it keeps standing there until the server has had time to confirm it.")
-        .defaultValue(0.5).min(0).max(10).sliderMax(5).decimalPlaces(1).build());
+        .defaultValue(0.2).min(0).max(10).sliderMax(5).decimalPlaces(1).build());
 
     private final Setting<Double> extraShulkerTime = sg.add(new DoubleSetting.Builder()
         .name("extra-shulker-time").description("The same extra time, for shulker boxes (breaking them and waiting for the drop).")
-        .defaultValue(1.0).min(0).max(10).sliderMax(5).decimalPlaces(1).build());
+        .defaultValue(0.5).min(0).max(10).sliderMax(5).decimalPlaces(1).build());
 
     private final Setting<Integer> lookSpeed = sg.add(new IntSetting.Builder()
         .name("look-speed").description("Max degrees your view turns per tick when facing a block.")
@@ -321,6 +321,9 @@ public class SpawnerProtect extends Module {
         }
 
         // A block that vanished may just be the client guessing. Only count it as mined once it has stayed gone.
+        // While we wait for that, we keep going on the next block if it's already in reach (we're standing
+        // still anyway); we only hold back if we would have to walk.
+        boolean confirming = false;
         if (pendingBreak != null) {
             if (isMineable(pendingBreak)) {
                 stackCheck = pendingBreak;
@@ -336,7 +339,7 @@ public class SpawnerProtect extends Module {
                 pendingBreak = null;
                 delayTicks = (int) Math.round(mineDelay.get() * 20); // 20 ticks per second
             } else {
-                return; // stay put while the server catches up
+                confirming = true; // keep standing still, but don't sit idle
             }
         }
         if (pendingBreak == null && mineTarget != null && !isMineable(mineTarget)) {
@@ -420,6 +423,7 @@ public class SpawnerProtect extends Module {
         if (dist > mineReach.get()) {
             boolean stuck = ++walkTicks > 60 && dist <= 4.4; // walls in the way: mine from where we are
             if (!stuck) {
+                if (confirming) return; // don't move until the server confirmed the last break
                 walkTo(center);
                 return;
             }
@@ -454,7 +458,7 @@ public class SpawnerProtect extends Module {
             if (!isLookingAt(target) && ++lookTicks < 40) return;
         }
         // Hold the aim for a moment before the first break packet.
-        if (aimWait < 2) {
+        if (aimWait < 1) {
             aimWait++;
             return;
         }
@@ -483,7 +487,7 @@ public class SpawnerProtect extends Module {
         mineTicks = 0;
         lookTicks = 0;
         aimWait = 0;
-        delayTicks = Math.max(delayTicks, 10); // give the server half a second to settle before retrying
+        delayTicks = Math.max(delayTicks, 5); // short pause before retrying
         String where = target.getX() + " " + target.getY() + " " + target.getZ();
         if (n >= MAX_ATTEMPTS) {
             skipped.add(target);
@@ -1263,15 +1267,4 @@ public class SpawnerProtect extends Module {
         settleTicks = 4; // stand still a moment once we arrive
     }
 
-    private void stopWalking() {
-        if (mc.options != null) {
-            mc.options.forwardKey.setPressed(false);
-            mc.options.jumpKey.setPressed(false);
-        }
-    }
-
-    private void releaseAllKeys() {
-        stopWalking();
-        if (mc.options != null) mc.options.sneakKey.setPressed(false);
-    }
-}
+    private void stopWalking()
