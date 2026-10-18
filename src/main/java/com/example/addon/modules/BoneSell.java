@@ -12,6 +12,7 @@ import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.multiplayer.ConnectScreen;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
+import net.minecraft.client.option.KeyBinding;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.LoreComponent;
 import net.minecraft.item.ItemStack;
@@ -129,7 +130,9 @@ public class BoneSell extends Module {
     private boolean autoRun;
     private final List<BlockPos> autoQueue = new ArrayList<>();
     private long nextAutoAt;
-    private int walkTicks, autoLookTicks;
+    private int walkTicks, autoLookTicks, stuckTicks;
+    private double bestDist = Double.MAX_VALUE;
+    private BlockPos walkTarget;
     private int confirmClicksDone, confirmSlot = -1, closeWait;
     private int rejoinTimer, connectTicks, connectAttempts;
     private boolean disconnected;
@@ -151,7 +154,9 @@ public class BoneSell extends Module {
         autoRun = false;
         autoQueue.clear();
         nextAutoAt = 0;
-        walkTicks = autoLookTicks = 0;
+        walkTicks = autoLookTicks = stuckTicks = 0;
+        bestDist = Double.MAX_VALUE;
+        walkTarget = null;
         confirmClicksDone = closeWait = 0;
         confirmSlot = -1;
         rejoinTimer = connectTicks = connectAttempts = 0;
@@ -163,6 +168,7 @@ public class BoneSell extends Module {
     @Override
     public void onDeactivate() {
         releaseMoveKeys();
+        stopSprint();
         if (mc.player != null && menuOpen()) mc.player.closeHandledScreen();
     }
 
@@ -539,18 +545,40 @@ public class BoneSell extends Module {
         }
 
         Vec3d center = Vec3d.ofCenter(next);
-        if (mc.player.getEyePos().distanceTo(center) > 3.8) {
-            if (++walkTicks > 200) {
-                warning("Couldn't walk to the spawner at " + next.getX() + " " + next.getY() + " " + next.getZ() + " - skipping it.");
+        double dist = mc.player.getEyePos().distanceTo(center);
+
+        if (!next.equals(walkTarget)) {
+            walkTarget = next;
+            bestDist = Double.MAX_VALUE;
+            stuckTicks = 0;
+            walkTicks = 0;
+        }
+
+        // In reach (or close enough after being stuck for a few seconds)?
+        boolean inReach = dist <= 3.8 || (dist <= 4.4 && stuckTicks > 60);
+        if (!inReach) {
+            // Keep running at it until we can reach it. Notice if we're not getting anywhere.
+            if (dist < bestDist - 0.3) {
+                bestDist = dist;
+                stuckTicks = 0;
+            } else {
+                stuckTicks++;
+            }
+
+            if (++walkTicks > 1200) { // a full minute: something is really in the way
+                warning("Couldn't get to the spawner at " + next.getX() + " " + next.getY() + " " + next.getZ() + " after a minute - skipping it.");
                 autoQueue.remove(0);
-                walkTicks = 0;
+                walkTarget = null;
+                stopSprint();
                 return;
             }
-            walkToward(center);
+            runToward(center, stuckTicks > 60);
             return;
         }
 
+        stopSprint();
         walkTicks = 0;
+        stuckTicks = 0;
         autoLookTicks = 0;
         target = next;
         openTicks = 0;
@@ -561,10 +589,12 @@ public class BoneSell extends Module {
     private void finishAutoRun() {
         autoRun = false;
         releaseMoveKeys();
+        stopSprint();
         info("Auto sell-all finished. Next run in " + autoHours.get() + " hours.");
     }
 
-    private void walkToward(Vec3d dest) {
+    /** Run (sprint) toward a point. If we're stuck, jump and sidestep to get around what's in the way. */
+    private void runToward(Vec3d dest, boolean unstick) {
         double dx = dest.x - mc.player.getX();
         double dz = dest.z - mc.player.getZ();
         float targetYaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90f;
@@ -572,14 +602,37 @@ public class BoneSell extends Module {
         float stepYaw = Math.abs(d) < 1.5f ? d : MathHelper.clamp(d * 0.35f, -30f, 30f);
         mc.player.setYaw(mc.player.getYaw() + stepYaw);
 
-        if (Math.abs(d) < 45f) mc.options.forwardKey.setPressed(true); // turn first, then walk
+        if (Math.abs(d) < 45f) {
+            mc.options.forwardKey.setPressed(true); // turn first, then run
+            setKey(mc.options.sprintKey, true);
+        }
         if (mc.player.horizontalCollision) mc.options.jumpKey.setPressed(true);
+
+        if (unstick) {
+            // Hop every half second and sidestep left/right every second to get around corners.
+            if (walkTicks % 10 < 3) mc.options.jumpKey.setPressed(true);
+            if ((walkTicks / 20) % 2 == 0) mc.options.leftKey.setPressed(true);
+            else mc.options.rightKey.setPressed(true);
+        }
+    }
+
+    private void stopSprint() {
+        if (mc.options != null) setKey(mc.options.sprintKey, false);
+    }
+
+    /** Put a key in the wanted state, only changing it if needed (works with "Sprint: Toggle" too). */
+    private void setKey(KeyBinding key, boolean down) {
+        if (key.isPressed() == down) return;
+        key.setPressed(down);
+        if (key.isPressed() != down) key.setPressed(true); // toggle-mode keys flip on each press
     }
 
     private void releaseMoveKeys() {
         if (mc.options != null) {
             mc.options.forwardKey.setPressed(false);
             mc.options.jumpKey.setPressed(false);
+            mc.options.leftKey.setPressed(false);
+            mc.options.rightKey.setPressed(false);
         }
     }
 
