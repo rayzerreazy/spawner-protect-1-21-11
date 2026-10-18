@@ -1267,4 +1267,15 @@ public class SpawnerProtect extends Module {
         settleTicks = 4; // stand still a moment once we arrive
     }
 
-    private void stopWalking()
+    private void stopWalking() {
+        if (mc.options != null) {
+            mc.options.forwardKey.setPressed(false);
+            mc.options.jumpKey.setPressed(false);
+        }
+    }
+
+    private void releaseAllKeys() {
+        stopWalking();
+        if (mc.options != null) mc.options.sneakKey.setPressed(false);
+    }
+}
