@@ -1,5 +1,6 @@
 package com.example.addon;
 
+import com.example.addon.modules.AutoDigout;
 import com.example.addon.modules.BoneSell;
 import com.example.addon.modules.AutoTpa;
 import com.example.addon.modules.SpawnerProtect;
@@ -26,6 +27,7 @@ public class AddonTemplate extends MeteorAddon {
         LOG.info("Initializing Meteor Addon Template");
 
         // Modules
+        Modules.get().add(new AutoDigout());
         Modules.get().add(new BoneSell());
         Modules.get().add(new AutoTpa());
         Modules.get().add(new SpawnerProtect());
